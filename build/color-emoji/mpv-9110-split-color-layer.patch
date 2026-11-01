@@ -1,33 +1,42 @@
-From bd2a5f5503351b311d61d0a540157ce5cb22cab1 Mon Sep 17 00:00:00 2001
+From 5fcfada83e3d26a7b4c674db9ba3365b35ec8d6d Mon Sep 17 00:00:00 2001
 From: yaozhi-local <local@localhost>
 Date: Mon, 2 Nov 2026 07:07:28 +0800
 Subject: [PATCH] sub: keep color bitmaps off the text layer
 
-The color emoji support makes a track that contains one colored bitmap
-render the *whole* subtitle layer as BGRA, and the BGRA path blends every
-pixel in software while the coverage path is a memcpy per bitmap. Measured
-on the user's setup (3072x1920, fullscreen danmaku, 20 s): the same content
-costs 5.4 s CPU as Y8 and 19.3 s as merged BGRA, with only ~15% of the ink
+The BGRA OSD path blends every ink pixel in software, while the coverage
+(Y8) path is one memcpy per bitmap. Forcing the whole subtitle layer to
+BGRA because a few emoji on it carry color therefore makes all the text
+pay for them: the same 20 s of fullscreen danmaku measured 5.4 CPU
+seconds as Y8 against 19.3 s merged as BGRA, with only ~15% of the ink
 actually colored.
 
-So split the two: color bitmaps get their own BGRA layer (a new OSD object
-type next to the primary subtitle track, so it has its own VO cache slot and
-draws between the text and the OSD), and everything else goes back to the
-coverage format. --force-rgba-osd-rendering, VOs that cannot do Y8, the OSD
-layer, script overlays and the secondary track keep the single merged layer
-they had; tracks without color bitmaps are unaffected either.
+Split the packer output by bitmap type instead. Text stays in the
+coverage format; color bitmaps go to a BGRA layer of their own, which
+the VO draws right after. Tracks and VOs that cannot take the second
+layer (force-rgba-osd-rendering, BGRA-only formats, the OSD and external
+ASS objects) keep the old merged behavior unchanged, and a track with no
+color bitmaps never allocates the color atlas at all.
+
+The color layer needs its own mp_osdtype entries because the VO cache is
+keyed by render_index, one slot per object: OSDTYPE_SUB_COLOR and
+OSDTYPE_SUB2_COLOR mirror the two subtitle slots, share their dec_sub and
+visibility, and are filled as a side product of the text layer's
+get_bitmaps() call in the same osd_render() pass. Both subtitle slots
+need it, not just the primary: the danmaku the user actually watches is
+attached as the secondary track, so splitting only the primary would have
+left the regression exactly where it hurt.
 ---
  sub/dec_sub.c    |  18 +++++
  sub/dec_sub.h    |   2 +
- sub/osd.c        |  13 +++
+ sub/osd.c        |  19 +++++
  sub/osd.h        |   5 +-
  sub/osd_libass.c |   5 +-
- sub/osd_state.h  |   5 ++
+ sub/osd_state.h  |   9 +++
  sub/packer.c     | 207 ++++++++++++++++++++++++++++++-----------------
  sub/packer.h     |   8 +-
  sub/sd.h         |   3 +
- sub/sd_ass.c     |  32 +++++++-
- 10 files changed, 219 insertions(+), 79 deletions(-)
+ sub/sd_ass.c     |  40 ++++++++-
+ 10 files changed, 236 insertions(+), 80 deletions(-)
 
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
 index 33b3878..445c7a8 100644
@@ -72,45 +81,54 @@ index 8b590d5..b130401 100644
  char *sub_ass_get_extradata(struct dec_sub *sub);
  struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 diff --git a/sub/osd.c b/sub/osd.c
-index 92a5326..86112ab 100644
+index 92a5326..ca627e4 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -183,6 +183,7 @@ struct osd_state *osd_create(struct mpv_global *global)
+@@ -183,6 +183,8 @@ struct osd_state *osd_create(struct mpv_global *global)
  
      osd->objs[OSDTYPE_SUB]->is_sub = true;
      osd->objs[OSDTYPE_SUB2]->is_sub = true;
 +    osd->objs[OSDTYPE_SUB_COLOR]->is_sub = true;
++    osd->objs[OSDTYPE_SUB2_COLOR]->is_sub = true;
  
      return osd;
  }
-@@ -220,6 +221,12 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+@@ -217,9 +219,15 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+ {
+     mp_mutex_lock(&osd->lock);
+     if (index >= 0 && index < 2) {
++        // Both subtitle slots are pairs: the text layer and the color layer that
++        // mirrors it (see OSDTYPE_SUB_COLOR). Each needs the decoder, because
++        // each is rendered by its own render_object() call.
          struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
++        struct osd_object *color = osd->objs[OSDTYPE_SUB_COLOR + index];
          obj->sub = dec_sub;
          obj->vo_change_id += 1;
-+        if (index == 0) {
-+            // The color layer of the primary track is fed by the same decoder.
-+            struct osd_object *color = osd->objs[OSDTYPE_SUB_COLOR];
-+            color->sub = dec_sub;
-+            color->vo_change_id += 1;
-+        }
++        color->sub = dec_sub;
++        color->vo_change_id += 1;
      }
      osd->want_redraw_notification = true;
      mp_mutex_unlock(&osd->lock);
-@@ -368,6 +375,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+@@ -368,6 +376,17 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
          if (obj->sub && sub_is_secondary_visible(obj->sub))
              res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
          osd->secondary_has_output = res && res->num_parts > 0 && !res->static_image;
-+    } else if (obj->type == OSDTYPE_SUB_COLOR) {
-+        // Side product of the primary track's get_bitmaps() call, which this
-+        // object mirrors: the loop above renders OSDTYPE_SUB first, in this same
-+        // pass and under the same lock, so the layer is for this exact pts.
-+        if (obj->sub && sub_is_primary_visible(obj->sub))
++    } else if (obj->type == OSDTYPE_SUB_COLOR ||
++               obj->type == OSDTYPE_SUB2_COLOR) {
++        // Side product of the matching text layer's get_bitmaps() call, which
++        // this object mirrors: that call happens earlier in this same pass, under
++        // the same lock, and with the same visibility predicate (including the
++        // extrapolated clock the secondary branch above uses), so the layer is
++        // for this exact pts.
++        bool secondary = obj->type == OSDTYPE_SUB2_COLOR;
++        if (obj->sub && (secondary ? sub_is_secondary_visible(obj->sub)
++                                   : sub_is_primary_visible(obj->sub)))
 +            res = sub_get_color_bitmaps(obj->sub);
      } else if (obj->type == OSDTYPE_EXTERNAL2 ||
                 obj->type == OSDTYPE_DISC_MENU) {
          if (obj->image_overlay && obj->image_overlay->format) {
 diff --git a/sub/osd.h b/sub/osd.h
-index 11823f9..746cedd 100644
+index 11823f9..c67e57b 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
 @@ -132,7 +132,10 @@ struct mp_osd_res {
@@ -120,22 +138,22 @@ index 11823f9..746cedd 100644
 -#define MAX_OSD_PARTS 6
 +// One slot per enum mp_osdtype entry: a layer that shares another layer's
 +// visibility but needs its own VO cache still needs an index of its own
-+// (OSDTYPE_SUB_COLOR), so adding one means adding the other.
-+#define MAX_OSD_PARTS 7
++// (OSDTYPE_SUB_COLOR, OSDTYPE_SUB2_COLOR), so adding one means adding the other.
++#define MAX_OSD_PARTS 8
  
  // Start of OSD symbols in osd_font.pfb
  #define OSD_CODEPOINTS 0xE000
 diff --git a/sub/osd_libass.c b/sub/osd_libass.c
-index 7b08509..6aa6a24 100644
+index 7b08509..9d8fbd5 100644
 --- a/sub/osd_libass.c
 +++ b/sub/osd_libass.c
 @@ -714,8 +714,11 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
  
  done:;
      struct sub_bitmaps out_imgs = {0};
-+    // No split layer here: the OSD, script overlays and the secondary subtitle
-+    // track have no consumer for a second image, so color bitmaps still merge
-+    // into BGRA for them.
++    // No split layer here: only the two subtitle slots have a color object of
++    // their own, so for the OSD, script overlays and external ASS a color bitmap
++    // still forces the whole layer to BGRA, as before.
      mp_sub_packer_pack_ass(obj->sub_packer, obj->ass_imgs, obj->num_externals + 1,
 -                       obj->changed, false, format, &out_imgs);
 +                       obj->changed, false, format, &out_imgs, NULL);
@@ -143,17 +161,21 @@ index 7b08509..6aa6a24 100644
      obj->changed = false;
  
 diff --git a/sub/osd_state.h b/sub/osd_state.h
-index d50537f..4e6a686 100644
+index d50537f..2ec183e 100644
 --- a/sub/osd_state.h
 +++ b/sub/osd_state.h
-@@ -10,6 +10,11 @@ enum mp_osdtype {
+@@ -10,6 +10,15 @@ enum mp_osdtype {
      OSDTYPE_SUB,
      OSDTYPE_SUB2, // IDs must be numerically successive
  
-+    // Color bitmaps (color emoji) of OSDTYPE_SUB, on a BGRA layer of their own
-+    // so that the text can stay in the cheap coverage format. Shares the
-+    // primary track's visibility and dec_sub; rendered right after it.
++    // Color bitmaps (color emoji) of the two subtitle tracks, each on a BGRA
++    // layer of its own so the text can stay in the cheap coverage format. A
++    // layer needs its own id whenever it wants a separate VO cache slot, even
++    // though visibility and dec_sub are shared with the text layer it mirrors.
++    // Both are drawn after both text layers, since ascending id == z-order.
++    // IDs must be numerically successive, like the text layers above.
 +    OSDTYPE_SUB_COLOR,
++    OSDTYPE_SUB2_COLOR,
 +
      OSDTYPE_DISC_MENU,
  
@@ -557,7 +579,7 @@ index d7cea26..35a8b3c 100644
      struct sd_times (*get_times)(struct sd *sd, double pts);
      struct sub_lines *(*get_lines)(struct sd *sd);
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index 1ec17c8..8662982 100644
+index 1ec17c8..8a8739f 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
 @@ -55,6 +55,7 @@ struct sd_ass_priv {
@@ -576,24 +598,33 @@ index 1ec17c8..8662982 100644
  
      // Explicit opt-in for positioned ASS on the secondary subtitle slot.
      // Keep primary/converted subtitles and the ASS event clock unchanged.
-@@ -864,7 +866,10 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -864,9 +866,17 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
      int changed;
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
      int64_t pack_start = timing ? mp_time_ns() : 0;
 -    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
-+    // Only the primary track has a consumer for the color layer (OSDTYPE_SUB_COLOR),
-+    // so the secondary slot keeps the single merged layer it always had.
+-    if (sd->order == 1 && !converted)
++    // Color bitmaps go to a layer of their own, read back later in the same
++    // osd_render() pass by this track's color object (OSDTYPE_SUB_COLOR /
++    // OSDTYPE_SUB2_COLOR), so that the text can stay in the cheap coverage format.
 +    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res,
-+                           sd->order == 0 ? &color : NULL);
-     if (sd->order == 1 && !converted)
++                           &color);
++    if (sd->order == 1 && !converted) {
          res->static_image = !secondary_has_animation(ctx, track, ts);
++        // The color layer belongs to the same presentation, so the reuse of a
++        // static secondary frame has to cover it too.
++        color.static_image = res->static_image;
++    }
      if (timing) {
-@@ -910,12 +915,30 @@ done:
+         int64_t ass_ns = pack_start - ass_start;
+         int64_t pack_ns = mp_time_ns() - pack_start;
+@@ -910,12 +920,31 @@ done:
      // mangle_colors() modifies the color field, so copy the thing _before_.
      res = sub_bitmaps_copy(&ctx->copy_cache, res);
  
-+    // Kept for the OSDTYPE_SUB_COLOR object, which is rendered right after this
-+    // in the same osd_render() pass and takes ownership when it reads it. The
++    // Kept for the color object that mirrors this track (OSDTYPE_SUB_COLOR /
++    // OSDTYPE_SUB2_COLOR), which osd_render() reads later in the same pass and
++    // which takes ownership when it does. The
 +    // emoji colors were baked into that layer by the packer, so like before this
 +    // split they are not mangled; what changes is that the text no longer loses
 +    // mangling just because some emoji happens to be on screen.
@@ -619,7 +650,7 @@ index 1ec17c8..8662982 100644
  #define MAX_BUF_SIZE 1024 * 1024
  #define MIN_EXPAND_SIZE 4096
  
-@@ -1121,6 +1144,10 @@ static void reset(struct sd *sd)
+@@ -1121,6 +1150,10 @@ static void reset(struct sd *sd)
  {
      struct sd_ass_priv *ctx = sd->priv;
      ctx->animation_valid = false;
@@ -630,7 +661,7 @@ index 1ec17c8..8662982 100644
      if (ctx->replacement_ass) {
          ctx->clear_once = false;
          return; // Complete replacement includes its own seekable timeline.
-@@ -1144,6 +1171,8 @@ static void uninit(struct sd *sd)
+@@ -1144,6 +1177,8 @@ static void uninit(struct sd *sd)
          lavc_conv_uninit(ctx->converter);
      assobjects_destroy(sd);
      talloc_free(ctx->copy_cache);
@@ -639,7 +670,7 @@ index 1ec17c8..8662982 100644
  }
  
  static struct sub_lines *get_lines(struct sd *sd)
-@@ -1241,6 +1270,7 @@ const struct sd_functions sd_ass = {
+@@ -1241,6 +1276,7 @@ const struct sd_functions sd_ass = {
      .init = init,
      .decode = decode,
      .get_bitmaps = get_bitmaps,

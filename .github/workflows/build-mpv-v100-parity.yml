@@ -621,6 +621,7 @@ jobs:
           grep -Fq 'draw_ass_color' packages/mpv-9100-color-emoji-bgra.patch
           grep -Fq 'is_color' packages/mpv-9100-color-emoji-bgra.patch
           grep -Fq 'OSDTYPE_SUB_COLOR' packages/mpv-9110-split-color-layer.patch
+          grep -Fq 'OSDTYPE_SUB2_COLOR' packages/mpv-9110-split-color-layer.patch
           grep -Fq 'get_color_bitmaps' packages/mpv-9110-split-color-layer.patch
           # Rewriting the blend to avoid `x / (255 * 255)` was measured
           # CPU-neutral: the divisor is a compile-time constant, so GCC already
