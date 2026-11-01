@@ -1,4 +1,4 @@
-From 7d7f387a085c590a27de1e842978911f2fd478ce Mon Sep 17 00:00:00 2001
+From bd2a5f5503351b311d61d0a540157ce5cb22cab1 Mon Sep 17 00:00:00 2001
 From: yaozhi-local <local@localhost>
 Date: Mon, 2 Nov 2026 07:07:28 +0800
 Subject: [PATCH] sub: keep color bitmaps off the text layer
@@ -20,14 +20,14 @@ they had; tracks without color bitmaps are unaffected either.
  sub/dec_sub.c    |  18 +++++
  sub/dec_sub.h    |   2 +
  sub/osd.c        |  13 +++
- sub/osd.h        |   4 +-
+ sub/osd.h        |   5 +-
  sub/osd_libass.c |   5 +-
  sub/osd_state.h  |   5 ++
  sub/packer.c     | 207 ++++++++++++++++++++++++++++++-----------------
  sub/packer.h     |   8 +-
  sub/sd.h         |   3 +
- sub/sd_ass.c     |  29 ++++++-
- 10 files changed, 215 insertions(+), 79 deletions(-)
+ sub/sd_ass.c     |  32 +++++++-
+ 10 files changed, 219 insertions(+), 79 deletions(-)
 
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
 index 33b3878..445c7a8 100644
@@ -59,10 +59,10 @@ index 33b3878..445c7a8 100644
  char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
  {
 diff --git a/sub/dec_sub.h b/sub/dec_sub.h
-index 63832cb..03bb0a3 100644
+index 8b590d5..b130401 100644
 --- a/sub/dec_sub.h
 +++ b/sub/dec_sub.h
-@@ -63,6 +63,8 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+@@ -64,6 +64,8 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                        bool *packets_read, bool *sub_updated);
  struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
                                      int format, double pts);
@@ -72,7 +72,7 @@ index 63832cb..03bb0a3 100644
  char *sub_ass_get_extradata(struct dec_sub *sub);
  struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 diff --git a/sub/osd.c b/sub/osd.c
-index 0a073bd..bf9b65f 100644
+index 92a5326..86112ab 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
 @@ -183,6 +183,7 @@ struct osd_state *osd_create(struct mpv_global *global)
@@ -96,10 +96,10 @@ index 0a073bd..bf9b65f 100644
      }
      osd->want_redraw_notification = true;
      mp_mutex_unlock(&osd->lock);
-@@ -333,6 +340,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
-     } else if (obj->type == OSDTYPE_SUB2) {
+@@ -368,6 +375,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
          if (obj->sub && sub_is_secondary_visible(obj->sub))
              res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
+         osd->secondary_has_output = res && res->num_parts > 0 && !res->static_image;
 +    } else if (obj->type == OSDTYPE_SUB_COLOR) {
 +        // Side product of the primary track's get_bitmaps() call, which this
 +        // object mirrors: the loop above renders OSDTYPE_SUB first, in this same
@@ -110,16 +110,17 @@ index 0a073bd..bf9b65f 100644
                 obj->type == OSDTYPE_DISC_MENU) {
          if (obj->image_overlay && obj->image_overlay->format) {
 diff --git a/sub/osd.h b/sub/osd.h
-index 6793587..a8aa6c0 100644
+index 11823f9..746cedd 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -128,7 +128,9 @@ struct mp_osd_res {
+@@ -132,7 +132,10 @@ struct mp_osd_res {
  bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b);
  
  // 0 <= sub_bitmaps.render_index < MAX_OSD_PARTS
 -#define MAX_OSD_PARTS 6
-+// One slot per enum mp_osdtype entry, plus room for any layer that shares an
-+// existing layer's visibility but needs its own cache (see OSDTYPE_SUB_COLOR).
++// One slot per enum mp_osdtype entry: a layer that shares another layer's
++// visibility but needs its own VO cache still needs an index of its own
++// (OSDTYPE_SUB_COLOR), so adding one means adding the other.
 +#define MAX_OSD_PARTS 7
  
  // Start of OSD symbols in osd_font.pfb
@@ -142,7 +143,7 @@ index 7b08509..6aa6a24 100644
      obj->changed = false;
  
 diff --git a/sub/osd_state.h b/sub/osd_state.h
-index 57bd565..aa687b7 100644
+index d50537f..4e6a686 100644
 --- a/sub/osd_state.h
 +++ b/sub/osd_state.h
 @@ -10,6 +10,11 @@ enum mp_osdtype {
@@ -556,10 +557,10 @@ index d7cea26..35a8b3c 100644
      struct sd_times (*get_times)(struct sd *sd, double pts);
      struct sub_lines *(*get_lines)(struct sd *sd);
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index db4d67d..dec4bd1 100644
+index 1ec17c8..8662982 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -54,6 +54,7 @@ struct sd_ass_priv {
+@@ -55,6 +55,7 @@ struct sd_ass_priv {
      bool clear_once;
      struct mp_sub_packer *packer;
      struct sub_bitmap_copy_cache *copy_cache;
@@ -567,23 +568,27 @@ index db4d67d..dec4bd1 100644
      bstr last_text;
      struct mp_image_params video_params;
      struct mp_image_params last_params;
-@@ -735,6 +736,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -808,6 +809,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
      ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
      ASS_Renderer *renderer = ctx->ass_renderer;
      struct sub_bitmaps *res = &(struct sub_bitmaps){0};
 +    struct sub_bitmaps color = {0};
  
-     // Always update the osd_res
-     struct mp_osd_res old_osd = ctx->osd;
-@@ -779,18 +781,37 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
- 
+     // Explicit opt-in for positioned ASS on the secondary subtitle slot.
+     // Keep primary/converted subtitles and the ASS event clock unchanged.
+@@ -864,7 +866,10 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
      int changed;
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+     int64_t pack_start = timing ? mp_time_ns() : 0;
 -    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
++    // Only the primary track has a consumer for the color layer (OSDTYPE_SUB_COLOR),
++    // so the secondary slot keeps the single merged layer it always had.
 +    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res,
-+                           &color);
- 
- done:
++                           sd->order == 0 ? &color : NULL);
+     if (sd->order == 1 && !converted)
+         res->static_image = !secondary_has_animation(ctx, track, ts);
+     if (timing) {
+@@ -910,12 +915,30 @@ done:
      // mangle_colors() modifies the color field, so copy the thing _before_.
      res = sub_bitmaps_copy(&ctx->copy_cache, res);
  
@@ -614,17 +619,18 @@ index db4d67d..dec4bd1 100644
  #define MAX_BUF_SIZE 1024 * 1024
  #define MIN_EXPAND_SIZE 4096
  
-@@ -995,6 +1016,9 @@ static void fill_plaintext(struct sd *sd, double pts)
- static void reset(struct sd *sd)
+@@ -1121,6 +1144,10 @@ static void reset(struct sd *sd)
  {
      struct sd_ass_priv *ctx = sd->priv;
-+    // A layer left here belongs to a pts that no longer applies.
+     ctx->animation_valid = false;
++    // A layer left here belongs to a pts that no longer applies. Free it before
++    // the replacement_ass early return below, which skips the rest.
 +    talloc_free(ctx->color_layer);
 +    ctx->color_layer = NULL;
-     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
-         ass_flush_events(ctx->ass_track);
-         ctx->num_seen_packets = 0;
-@@ -1014,6 +1038,8 @@ static void uninit(struct sd *sd)
+     if (ctx->replacement_ass) {
+         ctx->clear_once = false;
+         return; // Complete replacement includes its own seekable timeline.
+@@ -1144,6 +1171,8 @@ static void uninit(struct sd *sd)
          lavc_conv_uninit(ctx->converter);
      assobjects_destroy(sd);
      talloc_free(ctx->copy_cache);
@@ -633,7 +639,7 @@ index db4d67d..dec4bd1 100644
  }
  
  static struct sub_lines *get_lines(struct sd *sd)
-@@ -1107,6 +1133,7 @@ const struct sd_functions sd_ass = {
+@@ -1241,6 +1270,7 @@ const struct sd_functions sd_ass = {
      .init = init,
      .decode = decode,
      .get_bitmaps = get_bitmaps,
