@@ -288,6 +288,42 @@ jobs:
             packages/
           cp "$color_emoji/mpv-9100-color-emoji-bgra.patch" packages/
 
+          # fontconfig and vulkan float on `main` and winbuild clones both with
+          # --filter=tree:0, so a treeless checkout has no preimage blobs for
+          # `git am --3way` to fall back on. Upstream moved src/fcdir.c and
+          # loader/loader.h on 2026-06-29/30, which makes winbuild's own
+          # patches unapplicable from that day on. Pin the last revisions whose
+          # preimages still apply (verified with `git apply --check`): the
+          # drift is fontconfig portal/app-font and loader API surface that mpv
+          # never consumes.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          PINS = [
+              ("packages/fontconfig.cmake", "62cfe6b228598e183db16b9fff381c6f8120138c"),
+              ("packages/vulkan.cmake", "299c923e47e08148a47b1df7628926cc183cb4fc"),
+          ]
+
+          for name, commit in PINS:
+              path = Path(name)
+              text = path.read_text()
+
+              if commit not in text:
+                  if "    GIT_TAG main\n" not in text:
+                      raise SystemExit(f"Could not locate branch tag in {name}")
+                  text = text.replace(
+                      "    GIT_TAG main\n",
+                      f"    GIT_TAG {commit}\n",
+                      1,
+                  )
+
+              # A pinned commit is checked out detached. Leaving GIT_REMOTE_NAME
+              # set makes winbuild's force-update helper try to resolve @{u}.
+              text = text.replace("    GIT_REMOTE_NAME origin\n", "")
+
+              path.write_text(text)
+          PY
+
           # Apply the single audited c318236 candidate mailbox. It
           # contains only the sixteen consecutive audited commits from the isolated
           # source tree; upstreamed fixes are supplied by the pinned base.
@@ -541,6 +577,14 @@ jobs:
             packages/sdl2-9001-spatial-channel-counts.patch
           grep -Fq "GIT_TAG 00fe2ec7ae677b7568fbbcbcbcb67d34bb4292a3" packages/libass.cmake
           grep -n 'PATCH_COMMAND.*libass-' packages/libass.cmake
+          grep -Fq "GIT_TAG 62cfe6b228598e183db16b9fff381c6f8120138c" packages/fontconfig.cmake
+          grep -Fq "GIT_TAG 299c923e47e08148a47b1df7628926cc183cb4fc" packages/vulkan.cmake
+          for floating in packages/fontconfig.cmake packages/vulkan.cmake; do
+            if grep -Fq 'GIT_REMOTE_NAME origin' "$floating"; then
+              echo "::error::pinned $floating still uses branch-only force-update"
+              exit 1
+            fi
+          done
           grep -Fq 'ass_font_get_color_strike' \
             packages/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch
           grep -Fq 'IMAGE_TYPE_COLOR' \
