@@ -324,6 +324,30 @@ jobs:
               path.write_text(text)
           PY
 
+          # libaribcaption renamed its MD5 helpers to aribcc_md5_* (6c3b4f3,
+          # 2026-10-06) so they no longer collide with OpenSSL's MD5_*. Until
+          # then winbuild compiled its own md5.c out with -DHAVE_OPENSSL=1 and
+          # let the calls bind to libcrypto; that macro is now the only thing
+          # standing between ffmpeg and three undefined references. Upstream
+          # winbuild-cmake dropped the workaround in b2856ee, which is newer
+          # than the MPV_WINBUILD_CMAKE_COMMIT pinned above, so drop it here.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("packages/libaribcaption.cmake")
+          text = path.read_text()
+
+          for flag in (
+              "        \"-DCMAKE_C_FLAGS='-DHAVE_OPENSSL=1'\"\n",
+              "        \"-DCMAKE_CXX_FLAGS='-DHAVE_OPENSSL=1'\"\n",
+          ):
+              if flag not in text:
+                  raise SystemExit("Could not locate libaribcaption openssl workaround")
+              text = text.replace(flag, "", 1)
+
+          path.write_text(text)
+          PY
+
           # Apply the single audited c318236 candidate mailbox. It
           # contains only the sixteen consecutive audited commits from the isolated
           # source tree; upstreamed fixes are supplied by the pinned base.
@@ -585,6 +609,10 @@ jobs:
               exit 1
             fi
           done
+          if grep -Fq 'HAVE_OPENSSL' packages/libaribcaption.cmake; then
+            echo "::error::libaribcaption still asks for OpenSSL's MD5_*"
+            exit 1
+          fi
           grep -Fq 'ass_font_get_color_strike' \
             packages/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch
           grep -Fq 'IMAGE_TYPE_COLOR' \
