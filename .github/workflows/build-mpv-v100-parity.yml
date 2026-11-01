@@ -287,6 +287,7 @@ jobs:
           cp "$color_emoji/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch" \
             packages/
           cp "$color_emoji/mpv-9100-color-emoji-bgra.patch" packages/
+          cp "$color_emoji/mpv-9110-packer-blend-without-division.patch" packages/
 
           # fontconfig and vulkan float on `main` and winbuild clones both with
           # --filter=tree:0, so a treeless checkout has no preimage blobs for
@@ -619,6 +620,14 @@ jobs:
             packages/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch
           grep -Fq 'draw_ass_color' packages/mpv-9100-color-emoji-bgra.patch
           grep -Fq 'is_color' packages/mpv-9100-color-emoji-bgra.patch
+          grep -Fq 'div255sq' packages/mpv-9110-packer-blend-without-division.patch
+          # Packing each glyph into its own slot was measured slower than the
+          # merged rectangles (48 dropped frames per 20 s against 35, and it
+          # left stale pixels), so it must not come back unnoticed.
+          if grep -Fq 'pack_rgba_slots' packages/mpv-9100-color-emoji-bgra.patch; then
+            echo "::error::per-slot color packing is rejected by measurement"
+            exit 1
+          fi
           # The candidate mailbox must not touch the subtitle packing this
           # patch depends on; both series are applied to the same tree.
           if grep -Fq 'diff --git a/sub/packer.c' \

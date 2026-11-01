@@ -1,4 +1,4 @@
-From bba8a8f9599bface1fae30c9aee7394a2a068df0 Mon Sep 17 00:00:00 2001
+From 61f10356f3fdb05410d18dc3a7fdb9d2cb6f7a41 Mon Sep 17 00:00:00 2001
 From: yaozhi-local <local@localhost>
 Date: Sun, 1 Nov 2026 18:23:38 +0800
 Subject: [PATCH] sub: render libass color bitmaps (color emoji) as
@@ -14,9 +14,9 @@ bitmap force the RGBA packing, which already exists for image-based subtitles
 and for force_rgba_osd. Color parts are blended with their own pixels, scaled
 by the run's opacity, instead of tinting a coverage map with the blend color.
 ---
- sub/osd.h    |   4 ++
- sub/packer.c | 122 +++++++++++++++++++++++++++++++++++++++++++++++----
- 2 files changed, 118 insertions(+), 8 deletions(-)
+ sub/osd.h    |  4 +++
+ sub/packer.c | 74 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 71 insertions(+), 7 deletions(-)
 
 diff --git a/sub/osd.h b/sub/osd.h
 index b62836e..6793587 100644
@@ -34,7 +34,7 @@ index b62836e..6793587 100644
          struct {
              const struct sbr_output_image *image;
 diff --git a/sub/packer.c b/sub/packer.c
-index bebb456..e03d76f 100644
+index bebb456..033fe66 100644
 --- a/sub/packer.c
 +++ b/sub/packer.c
 @@ -43,6 +43,7 @@ struct mp_sub_packer {
@@ -113,57 +113,7 @@ index bebb456..e03d76f 100644
          }
          fill_padding_4(b->bitmap, b->w, b->h, b->stride, padding);
      }
-@@ -264,17 +311,69 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
-     return true;
- }
- 
-+// Pack each bitmap into its own slot, the way pack_libass() does.
-+//
-+// The merged path above exists because a rectangle of composited pixels can be
-+// drawn as one quad, but it has to be cleared and re-uploaded as a whole, and
-+// with scrolling danmaku the merged rectangles cover the entire viewport: at
-+// 3072x1920 that is a 23.6 MB atlas rebuilt 60 times a second, on top of the
-+// 15xN overlap scan and the memset of every rectangle. Slots cost the size of
-+// the ink instead (a few hundred KB), need no clearing because each one is
-+// written exactly once, and let a fully opaque color bitmap be copied rather
-+// than blended. Overlapping glyphs then composite on the way to the screen
-+// instead of inside the atlas, which is the same result: source-over is
-+// associative and the part order is preserved.
-+static bool pack_rgba_slots(struct mp_sub_packer *p, struct sub_bitmaps *res)
-+{
-+    if (!pack(p, res, IMGFMT_BGRA))
-+        return false;
-+
-+    int padding = p->packer->padding;
-+    uint8_t *base = res->packed->planes[0];
-+    int stride = res->packed->stride[0];
-+
-+    for (int n = 0; n < res->num_parts; n++) {
-+        struct sub_bitmap *b = &res->parts[n];
-+        void *pdata = base + b->src_y * stride + b->src_x * 4;
-+
-+        if (b->libass.is_color && !(b->libass.color & 0xff)) {
-+            // Opaque run: draw_ass_color() would scale every channel by 255
-+            // over a transparent slot, i.e. copy it.
-+            memcpy_pic(pdata, b->bitmap, b->w * 4, b->h, stride, b->stride);
-+        } else if (b->libass.is_color) {
-+            draw_ass_color(b->bitmap, b->w, b->h, b->stride,
-+                           pdata, stride, 0, 0, b->libass.color);
-+        } else {
-+            draw_ass_rgba(b->bitmap, b->w, b->h, b->stride,
-+                          pdata, stride, 0, 0, b->libass.color);
-+        }
-+
-+        b->bitmap = pdata;
-+        b->stride = stride;
-+        fill_padding_4(pdata, b->w, b->h, stride, padding);
-+    }
-+
-+    res->format = SUBBITMAP_BGRA;
-+    return true;
-+}
-+
- // Pack the contents of image_lists[0] to image_lists[num_image_lists-1] into
+@@ -268,13 +315,19 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
  // a single image, and make *out point to it. *out is completely overwritten.
  // If libass reported any change, image_lists_changed must be set (it then
  // repacks all images). preferred_osd_format can be set to a desired
@@ -186,7 +136,7 @@ index bebb456..e03d76f 100644
  
      if (p->cached_subs_valid && !image_lists_changed &&
          p->cached_subs.format == format)
-@@ -293,6 +392,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+@@ -293,6 +346,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
          .video_color_space = video_color_space,
      };
  
@@ -194,7 +144,7 @@ index bebb456..e03d76f 100644
      for (int n = 0; n < num_image_lists; n++) {
          for (struct ass_image *img = image_lists[n]; img; img = img->next) {
              if (img->w == 0 || img->h == 0)
-@@ -303,6 +403,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+@@ -303,6 +357,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
              b->bitmap = img->bitmap;
              b->stride = img->stride;
              b->libass.color = img->color;
@@ -203,7 +153,7 @@ index bebb456..e03d76f 100644
              b->dw = b->w = img->w;
              b->dh = b->h = img->h;
              b->x = img->dst_x;
-@@ -311,9 +413,12 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+@@ -311,6 +367,9 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
          }
      }
  
@@ -212,12 +162,8 @@ index bebb456..e03d76f 100644
 +
      bool r = false;
      if (format == SUBBITMAP_BGRA) {
--        r = pack_rgba(p, &res);
-+        r = has_color ? pack_rgba_slots(p, &res) : pack_rgba(p, &res);
-     } else {
-         r = pack_libass(p, &res);
-     }
-@@ -321,6 +426,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+         r = pack_rgba(p, &res);
+@@ -321,6 +380,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
      if (!r)
          return;
  

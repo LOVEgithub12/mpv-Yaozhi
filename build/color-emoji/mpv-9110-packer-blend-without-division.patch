@@ -1,0 +1,81 @@
+From 14c5e46e417921499ba62d9f8081a7f88490f23c Mon Sep 17 00:00:00 2001
+From: yaozhi-local <local@localhost>
+Date: Mon, 2 Nov 2026 06:08:26 +0800
+Subject: [PATCH] packer: blend the OSD without dividing by 255*255
+
+draw_ass_rgba() ran four integer divides per pixel, and the color-bitmap
+blend added by the previous commit did the same. An IDIV is about 20
+cycles against 2 for a multiply and a shift, so the BGRA OSD is CPU-bound
+on the division: measuring a 20 s fullscreen danmaku window at 3072x1920,
+the process used 19 CPU s when the OSD was BGRA and 5 CPU s when it was Y8
+with exactly the same glyphs, and the only difference was which blend
+function ran.
+
+Both call sites build their numerator out of 8-bit operands, so it never
+exceeds 2*255^3 = 33162750. The reciprocal chosen here is exact for every
+input up to 73397415, verified by enumeration over the whole domain, so
+the blend output is bit-identical to the dividing version.
+---
+ sub/packer.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/sub/packer.c b/sub/packer.c
+index 033fe66..6fdc1cd 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -152,6 +152,22 @@ static void fill_padding_4(uint8_t *base, int w, int h, int stride, int padding)
+         memcpy(base + (h + i) * stride - padding * 4, last_row, row_bytes);
+ }
+ 
++// floor(n / (255 * 255)) without dividing.
++//
++// Both blend functions below need it once per channel per pixel, and every
++// numerator they build comes from 8-bit operands, so n <= 2 * 255^3 =
++// 33162750. The multiplier is exact up to 73397415, which was checked over the
++// whole range rather than assumed: a rounded reciprocal that looks close enough
++// starts being wrong at n = 130049. This matters because an integer divide is
++// ~20 cycles on x86-64 against 2 for a multiply and a shift, and it happens 4
++// times per pixel: at fullscreen danmaku density it is the difference between
++// an idle core and one running flat out, and so the whole cost of the OSD being
++// BGRA rather than Y8 (--force-rgba-osd-rendering, color emoji).
++static inline uint32_t div255sq(uint32_t n)
++{
++    return (uint32_t)(((uint64_t)n * 67636241ULL) >> 42);
++}
++
+ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
+                           int src_stride, unsigned char *dst, size_t dst_stride,
+                           int dst_x, int dst_y, uint32_t color)
+@@ -176,10 +192,10 @@ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
+             unsigned int dstg = (dstpix >>  8) & 0xFF;
+             unsigned int dstr = (dstpix >> 16) & 0xFF;
+             unsigned int dsta = (dstpix >> 24) & 0xFF;
+-            dstb = (bb       + dstb * (255 * 255 - aa)) / (255 * 255);
+-            dstg = (gg       + dstg * (255 * 255 - aa)) / (255 * 255);
+-            dstr = (rr       + dstr * (255 * 255 - aa)) / (255 * 255);
+-            dsta = (aa * 255 + dsta * (255 * 255 - aa)) / (255 * 255);
++            dstb = div255sq(bb       + dstb * (255 * 255 - aa));
++            dstg = div255sq(gg       + dstg * (255 * 255 - aa));
++            dstr = div255sq(rr       + dstr * (255 * 255 - aa));
++            dsta = div255sq(aa * 255 + dsta * (255 * 255 - aa));
+             dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
+         }
+     }
+@@ -216,10 +232,10 @@ static void draw_ass_color(unsigned char *src, int src_w, int src_h,
+             const unsigned int inv = 255 * 255 - aa;
+             // The source is premultiplied already, so scaling its channels by
+             // the run opacity is enough; 255 keeps the units of draw_ass_rgba().
+-            dstb = ((srcpix        & 0xFF) * a * 255 + dstb * inv) / (255 * 255);
+-            dstg = ((srcpix >>  8  & 0xFF) * a * 255 + dstg * inv) / (255 * 255);
+-            dstr = ((srcpix >> 16  & 0xFF) * a * 255 + dstr * inv) / (255 * 255);
+-            dsta = (         aa * 255      + dsta * inv) / (255 * 255);
++            dstb = div255sq((srcpix        & 0xFF) * a * 255 + dstb * inv);
++            dstg = div255sq((srcpix >>  8  & 0xFF) * a * 255 + dstg * inv);
++            dstr = div255sq((srcpix >> 16  & 0xFF) * a * 255 + dstr * inv);
++            dsta = div255sq(         aa * 255      + dsta * inv);
+             dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
+         }
+     }
+-- 
+2.51.2.windows.1
+
