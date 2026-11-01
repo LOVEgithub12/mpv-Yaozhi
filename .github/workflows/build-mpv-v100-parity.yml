@@ -287,7 +287,7 @@ jobs:
           cp "$color_emoji/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch" \
             packages/
           cp "$color_emoji/mpv-9100-color-emoji-bgra.patch" packages/
-          cp "$color_emoji/mpv-9110-packer-blend-without-division.patch" packages/
+          cp "$color_emoji/mpv-9110-split-color-layer.patch" packages/
 
           # fontconfig and vulkan float on `main` and winbuild clones both with
           # --filter=tree:0, so a treeless checkout has no preimage blobs for
@@ -620,7 +620,16 @@ jobs:
             packages/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch
           grep -Fq 'draw_ass_color' packages/mpv-9100-color-emoji-bgra.patch
           grep -Fq 'is_color' packages/mpv-9100-color-emoji-bgra.patch
-          grep -Fq 'div255sq' packages/mpv-9110-packer-blend-without-division.patch
+          grep -Fq 'OSDTYPE_SUB_COLOR' packages/mpv-9110-split-color-layer.patch
+          grep -Fq 'get_color_bitmaps' packages/mpv-9110-split-color-layer.patch
+          # Rewriting the blend to avoid `x / (255 * 255)` was measured
+          # CPU-neutral: the divisor is a compile-time constant, so GCC already
+          # strength-reduces it. The real cost is the BGRA path itself, which is
+          # why color bitmaps now live on their own layer.
+          if grep -Fq 'div255sq' packages/*.patch; then
+            echo "::error::division rewrite is rejected by measurement"
+            exit 1
+          fi
           # Packing each glyph into its own slot was measured slower than the
           # merged rectangles (48 dropped frames per 20 s against 35, and it
           # left stale pixels), so it must not come back unnoticed.

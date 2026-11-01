@@ -1,0 +1,646 @@
+From 7d7f387a085c590a27de1e842978911f2fd478ce Mon Sep 17 00:00:00 2001
+From: yaozhi-local <local@localhost>
+Date: Mon, 2 Nov 2026 07:07:28 +0800
+Subject: [PATCH] sub: keep color bitmaps off the text layer
+
+The color emoji support makes a track that contains one colored bitmap
+render the *whole* subtitle layer as BGRA, and the BGRA path blends every
+pixel in software while the coverage path is a memcpy per bitmap. Measured
+on the user's setup (3072x1920, fullscreen danmaku, 20 s): the same content
+costs 5.4 s CPU as Y8 and 19.3 s as merged BGRA, with only ~15% of the ink
+actually colored.
+
+So split the two: color bitmaps get their own BGRA layer (a new OSD object
+type next to the primary subtitle track, so it has its own VO cache slot and
+draws between the text and the OSD), and everything else goes back to the
+coverage format. --force-rgba-osd-rendering, VOs that cannot do Y8, the OSD
+layer, script overlays and the secondary track keep the single merged layer
+they had; tracks without color bitmaps are unaffected either.
+---
+ sub/dec_sub.c    |  18 +++++
+ sub/dec_sub.h    |   2 +
+ sub/osd.c        |  13 +++
+ sub/osd.h        |   4 +-
+ sub/osd_libass.c |   5 +-
+ sub/osd_state.h  |   5 ++
+ sub/packer.c     | 207 ++++++++++++++++++++++++++++++-----------------
+ sub/packer.h     |   8 +-
+ sub/sd.h         |   3 +
+ sub/sd_ass.c     |  29 ++++++-
+ 10 files changed, 215 insertions(+), 79 deletions(-)
+
+diff --git a/sub/dec_sub.c b/sub/dec_sub.c
+index 33b3878..445c7a8 100644
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -439,6 +439,24 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+     return res;
+ }
+ 
++// The color layer is a side product of sub_get_bitmaps(), so it only describes
++// the pts that call used. Mirroring that call's "subtitles already ended" guard
++// (sub->last_vo_pts is the pts it was handed) is what keeps a layer from
++// outliving the text it belongs to.
++struct sub_bitmaps *sub_get_color_bitmaps(struct dec_sub *sub)
++{
++    mp_mutex_lock(&sub->lock);
++
++    struct sub_bitmaps *res = NULL;
++
++    if (!(sub->end != MP_NOPTS_VALUE && sub->last_vo_pts >= sub->end) &&
++        sub->sd->driver->get_color_bitmaps)
++        res = sub->sd->driver->get_color_bitmaps(sub->sd);
++
++    mp_mutex_unlock(&sub->lock);
++    return res;
++}
++
+ // The returned string is talloc'ed.
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
+ {
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index 63832cb..03bb0a3 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -63,6 +63,8 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+                       bool *packets_read, bool *sub_updated);
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+                                     int format, double pts);
++// The color-bitmap layer that the last sub_get_bitmaps() call split off, if any.
++struct sub_bitmaps *sub_get_color_bitmaps(struct dec_sub *sub);
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+ char *sub_ass_get_extradata(struct dec_sub *sub);
+ struct sd_times sub_get_times(struct dec_sub *sub, double pts);
+diff --git a/sub/osd.c b/sub/osd.c
+index 0a073bd..bf9b65f 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -183,6 +183,7 @@ struct osd_state *osd_create(struct mpv_global *global)
+ 
+     osd->objs[OSDTYPE_SUB]->is_sub = true;
+     osd->objs[OSDTYPE_SUB2]->is_sub = true;
++    osd->objs[OSDTYPE_SUB_COLOR]->is_sub = true;
+ 
+     return osd;
+ }
+@@ -220,6 +221,12 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+         struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
+         obj->sub = dec_sub;
+         obj->vo_change_id += 1;
++        if (index == 0) {
++            // The color layer of the primary track is fed by the same decoder.
++            struct osd_object *color = osd->objs[OSDTYPE_SUB_COLOR];
++            color->sub = dec_sub;
++            color->vo_change_id += 1;
++        }
+     }
+     osd->want_redraw_notification = true;
+     mp_mutex_unlock(&osd->lock);
+@@ -333,6 +340,12 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+     } else if (obj->type == OSDTYPE_SUB2) {
+         if (obj->sub && sub_is_secondary_visible(obj->sub))
+             res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
++    } else if (obj->type == OSDTYPE_SUB_COLOR) {
++        // Side product of the primary track's get_bitmaps() call, which this
++        // object mirrors: the loop above renders OSDTYPE_SUB first, in this same
++        // pass and under the same lock, so the layer is for this exact pts.
++        if (obj->sub && sub_is_primary_visible(obj->sub))
++            res = sub_get_color_bitmaps(obj->sub);
+     } else if (obj->type == OSDTYPE_EXTERNAL2 ||
+                obj->type == OSDTYPE_DISC_MENU) {
+         if (obj->image_overlay && obj->image_overlay->format) {
+diff --git a/sub/osd.h b/sub/osd.h
+index 6793587..a8aa6c0 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -128,7 +128,9 @@ struct mp_osd_res {
+ bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b);
+ 
+ // 0 <= sub_bitmaps.render_index < MAX_OSD_PARTS
+-#define MAX_OSD_PARTS 6
++// One slot per enum mp_osdtype entry, plus room for any layer that shares an
++// existing layer's visibility but needs its own cache (see OSDTYPE_SUB_COLOR).
++#define MAX_OSD_PARTS 7
+ 
+ // Start of OSD symbols in osd_font.pfb
+ #define OSD_CODEPOINTS 0xE000
+diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+index 7b08509..6aa6a24 100644
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -714,8 +714,11 @@ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
+ 
+ done:;
+     struct sub_bitmaps out_imgs = {0};
++    // No split layer here: the OSD, script overlays and the secondary subtitle
++    // track have no consumer for a second image, so color bitmaps still merge
++    // into BGRA for them.
+     mp_sub_packer_pack_ass(obj->sub_packer, obj->ass_imgs, obj->num_externals + 1,
+-                       obj->changed, false, format, &out_imgs);
++                       obj->changed, false, format, &out_imgs, NULL);
+ 
+     obj->changed = false;
+ 
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+index 57bd565..aa687b7 100644
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -10,6 +10,11 @@ enum mp_osdtype {
+     OSDTYPE_SUB,
+     OSDTYPE_SUB2, // IDs must be numerically successive
+ 
++    // Color bitmaps (color emoji) of OSDTYPE_SUB, on a BGRA layer of their own
++    // so that the text can stay in the cheap coverage format. Shares the
++    // primary track's visibility and dec_sub; rendered right after it.
++    OSDTYPE_SUB_COLOR,
++
+     OSDTYPE_DISC_MENU,
+ 
+     OSDTYPE_OSD,
+diff --git a/sub/packer.c b/sub/packer.c
+index 033fe66..7e16be6 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -37,9 +37,11 @@
+ #include "video/out/bitmap_packer.h"
+ #include "video/mp_image.h"
+ 
+-struct mp_sub_packer {
++// Packing state of one output layer. There are two when color bitmaps are kept
++// on a layer of their own: each needs its own atlas, part array and cache, and
++// both are packed (and repacked) from the same ASS image lists.
++struct packer_ctx {
+     struct sub_bitmap *cached_parts; // only for the array memory
+-    struct sub_bitmap *cached_subrandr_images;
+     struct mp_image *cached_img;
+     struct sub_bitmaps cached_subs;
+     bool cached_subs_valid;
+@@ -48,54 +50,66 @@ struct mp_sub_packer {
+     struct bitmap_packer *packer;
+ };
+ 
+-// Free with talloc_free().
++struct mp_sub_packer {
++    struct packer_ctx *mono;  // what the VO asked for: coverage, or everything
++    struct packer_ctx *color; // color bitmaps, as a separate BGRA layer
++    struct sub_bitmap *cached_subrandr_images;
++};
++
++// Free with talloc_free(). Each context is its own talloc object, because the
++// atlas it allocates is stolen into it and repacked in place.
+ struct mp_sub_packer *mp_sub_packer_alloc(void *ta_parent)
+ {
+     struct mp_sub_packer *p = talloc_zero(ta_parent, struct mp_sub_packer);
+-    p->packer = talloc_zero(p, struct bitmap_packer);
+-    p->packer->padding = 1; // assume bilinear sampling
++    p->mono = talloc_zero(p, struct packer_ctx);
++    p->color = talloc_zero(p, struct packer_ctx);
++    struct packer_ctx *ctxs[2] = {p->mono, p->color};
++    for (int n = 0; n < 2; n++) {
++        ctxs[n]->packer = talloc_zero(ctxs[n], struct bitmap_packer);
++        ctxs[n]->packer->padding = 1; // assume bilinear sampling
++    }
+     return p;
+ }
+ 
+-static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
++static bool pack(struct packer_ctx *c, struct sub_bitmaps *res, int imgfmt)
+ {
+-    packer_set_size(p->packer, res->num_parts);
++    packer_set_size(c->packer, res->num_parts);
+ 
+     for (int n = 0; n < res->num_parts; n++)
+-        p->packer->in[n] = (struct pos){res->parts[n].w, res->parts[n].h};
++        c->packer->in[n] = (struct pos){res->parts[n].w, res->parts[n].h};
+ 
+-    if (p->packer->count == 0 || packer_pack(p->packer) < 0)
++    if (c->packer->count == 0 || packer_pack(c->packer) < 0)
+         return false;
+ 
+     struct pos bb[2];
+-    packer_get_bb(p->packer, bb);
++    packer_get_bb(c->packer, bb);
+ 
+     res->packed_w = bb[1].x;
+     res->packed_h = bb[1].y;
+ 
+-    if (!p->cached_img || p->cached_img->w < res->packed_w ||
+-                          p->cached_img->h < res->packed_h ||
+-                          p->cached_img->imgfmt != imgfmt)
++    if (!c->cached_img || c->cached_img->w < res->packed_w ||
++                          c->cached_img->h < res->packed_h ||
++                          c->cached_img->imgfmt != imgfmt)
+     {
+-        talloc_free(p->cached_img);
+-        p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
+-        if (!p->cached_img) {
+-            packer_reset(p->packer);
++        talloc_free(c->cached_img);
++        c->cached_img = mp_image_alloc(imgfmt, c->packer->w, c->packer->h);
++        if (!c->cached_img) {
++            packer_reset(c->packer);
+             return false;
+         }
+-        talloc_steal(p, p->cached_img);
++        talloc_steal(c, c->cached_img);
+     }
+ 
+-    if (!mp_image_make_writeable(p->cached_img)) {
+-        packer_reset(p->packer);
++    if (!mp_image_make_writeable(c->cached_img)) {
++        packer_reset(c->packer);
+         return false;
+     }
+ 
+-    res->packed = p->cached_img;
++    res->packed = c->cached_img;
+ 
+     for (int n = 0; n < res->num_parts; n++) {
+         struct sub_bitmap *b = &res->parts[n];
+-        struct pos pos = p->packer->result[n];
++        struct pos pos = c->packer->result[n];
+ 
+         b->src_x = pos.x;
+         b->src_y = pos.y;
+@@ -225,12 +239,12 @@ static void draw_ass_color(unsigned char *src, int src_w, int src_h,
+     }
+ }
+ 
+-static bool pack_libass(struct mp_sub_packer *p, struct sub_bitmaps *res)
++static bool pack_libass(struct packer_ctx *c, struct sub_bitmaps *res)
+ {
+-    if (!pack(p, res, IMGFMT_Y8))
++    if (!pack(c, res, IMGFMT_Y8))
+         return false;
+ 
+-    int padding = p->packer->padding;
++    int padding = c->packer->padding;
+     uint8_t *base = res->packed->planes[0];
+     int stride = res->packed->stride[0];
+ 
+@@ -247,7 +261,7 @@ static bool pack_libass(struct mp_sub_packer *p, struct sub_bitmaps *res)
+     return true;
+ }
+ 
+-static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
++static bool pack_rgba(struct packer_ctx *c, struct sub_bitmaps *res)
+ {
+     struct mp_rect bb_list[MP_SUB_BB_LIST_MAX];
+     int num_bb = mp_get_sub_bb_list(res, bb_list, MP_SUB_BB_LIST_MAX);
+@@ -255,7 +269,7 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
+     struct sub_bitmaps imgs = {
+         .change_id = res->change_id,
+         .format = SUBBITMAP_BGRA,
+-        .parts = p->rgba_imgs,
++        .parts = c->rgba_imgs,
+         .num_parts = num_bb,
+         .video_color_space = res->video_color_space,
+     };
+@@ -265,10 +279,10 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
+         imgs.parts[n].h = bb_list[n].y1 - bb_list[n].y0;
+     }
+ 
+-    if (!pack(p, &imgs, IMGFMT_BGRA))
++    if (!pack(c, &imgs, IMGFMT_BGRA))
+         return false;
+ 
+-    int padding = p->packer->padding;
++    int padding = c->packer->padding;
+     uint8_t *base = imgs.packed->planes[0];
+     int stride = imgs.packed->stride[0];
+ 
+@@ -317,33 +331,65 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
+ // repacks all images). preferred_osd_format can be set to a desired
+ // sub_bitmap_format; SUBBITMAP_LIBASS is used unless the images contain color
+ // bitmaps, which need SUBBITMAP_BGRA.
++// If out_color is non-NULL and the caller can render two layers, color bitmaps
++// go to their own BGRA layer there instead, and *out keeps the coverage format.
++// Splitting is what keeps the text out of the expensive path: a coverage layer
++// is one memcpy per bitmap, while a BGRA layer has to blend every pixel of its
++// ink in software (see pack_rgba), so merging the two makes all the text pay
++// for a handful of emoji.
+ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+                         int num_image_lists, bool image_lists_changed, bool video_color_space,
+-                        int preferred_osd_format, struct sub_bitmaps *out)
++                        int preferred_osd_format, struct sub_bitmaps *out,
++                        struct sub_bitmaps *out_color)
+ {
++    // A VO that cannot do the coverage format (or --force-rgba-osd-rendering)
++    // gets one merged BGRA layer, as before; splitting needs a consumer for the
++    // second layer as well.
++    bool split = out_color && preferred_osd_format != SUBBITMAP_BGRA;
++
+     // Color bitmaps carry their own pixels, which the libass format (8-bit
+-    // coverage plus a blend color) cannot express, so their presence forces
+-    // packing as BGRA. Whether the list has any only depends on its contents,
+-    // and the cache is only reused when those did not change, so consulting the
+-    // cached value here is enough to decide on a cache hit.
+-    int format = (preferred_osd_format == SUBBITMAP_BGRA || p->cached_has_color) ?
++    // coverage plus a blend color) cannot express, so without a split their
++    // presence forces packing as BGRA. Whether the list has any only depends on
++    // its contents, and the cache is only reused when those did not change, so
++    // consulting the cached value here is enough to decide on a cache hit. With
++    // a split the color part never reaches this layer, so it never has to know.
++    int format = (preferred_osd_format == SUBBITMAP_BGRA ||
++                  (!split && p->mono->cached_has_color)) ?
+                      SUBBITMAP_BGRA : SUBBITMAP_LIBASS;
+ 
+-    if (p->cached_subs_valid && !image_lists_changed &&
+-        p->cached_subs.format == format)
++    if (p->mono->cached_subs_valid && !image_lists_changed &&
++        p->mono->cached_subs.format == format &&
++        (!split || p->color->cached_subs_valid))
+     {
+-        *out = p->cached_subs;
++        *out = p->mono->cached_subs;
++        if (out_color)
++            *out_color = split ? p->color->cached_subs
++                               : (struct sub_bitmaps){0};
+         return;
+     }
+ 
+     *out = (struct sub_bitmaps){.change_id = 1};
+-    p->cached_subs_valid = false;
+-
+-    struct sub_bitmaps res = {
+-        .change_id = image_lists_changed,
+-        .format = SUBBITMAP_LIBASS,
+-        .parts = p->cached_parts,
+-        .video_color_space = video_color_space,
++    if (out_color)
++        *out_color = (struct sub_bitmaps){.change_id = 1};
++    p->mono->cached_subs_valid = false;
++    p->color->cached_subs_valid = false;
++
++    // Layer 0 is what *out gets, layer 1 the color split; without a split every
++    // bitmap goes to layer 0 and it becomes BGRA if any of them is colored.
++    struct packer_ctx *dst[2] = {p->mono, p->color};
++    struct sub_bitmaps layer[2] = {
++        [0] = {
++            .change_id = image_lists_changed,
++            .format = SUBBITMAP_LIBASS,
++            .parts = p->mono->cached_parts,
++            .video_color_space = video_color_space,
++        },
++        [1] = {
++            .change_id = image_lists_changed,
++            .format = SUBBITMAP_BGRA,
++            .parts = p->color->cached_parts,
++            .video_color_space = video_color_space,
++        },
+     };
+ 
+     bool has_color = false;
+@@ -351,40 +397,51 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+         for (struct ass_image *img = image_lists[n]; img; img = img->next) {
+             if (img->w == 0 || img->h == 0)
+                 continue;
+-            MP_TARRAY_GROW(p, p->cached_parts, res.num_parts);
+-            res.parts = p->cached_parts;
+-            struct sub_bitmap *b = &res.parts[res.num_parts];
++            bool color = img->type == IMAGE_TYPE_COLOR;
++            int which = split && color;
++            struct packer_ctx *c = dst[which];
++            struct sub_bitmaps *l = &layer[which];
++            MP_TARRAY_GROW(c, c->cached_parts, l->num_parts);
++            l->parts = c->cached_parts;
++            struct sub_bitmap *b = &l->parts[l->num_parts];
+             b->bitmap = img->bitmap;
+             b->stride = img->stride;
+             b->libass.color = img->color;
+-            b->libass.is_color = img->type == IMAGE_TYPE_COLOR;
+-            has_color |= b->libass.is_color;
++            b->libass.is_color = color;
++            has_color |= color;
+             b->dw = b->w = img->w;
+             b->dh = b->h = img->h;
+             b->x = img->dst_x;
+             b->y = img->dst_y;
+-            res.num_parts++;
++            l->num_parts++;
+         }
+     }
+ 
+-    if (has_color)
++    if (has_color && !split)
+         format = SUBBITMAP_BGRA;
+ 
+-    bool r = false;
+-    if (format == SUBBITMAP_BGRA) {
+-        r = pack_rgba(p, &res);
+-    } else {
+-        r = pack_libass(p, &res);
+-    }
++    // A layer without bitmaps has no atlas to fill, which is not a failure: an
++    // emoji-only line leaves the text layer empty, and vice versa.
++    bool mono_ok = !layer[0].num_parts ||
++                   (format == SUBBITMAP_BGRA ? pack_rgba(dst[0], &layer[0])
++                                             : pack_libass(dst[0], &layer[0]));
++    bool color_ok = !split || !layer[1].num_parts || pack_rgba(dst[1], &layer[1]);
+ 
+-    if (!r)
++    if (!mono_ok || !color_ok)
+         return;
+ 
+-    p->cached_has_color = has_color;
+-    *out = res;
+-    p->cached_subs = res;
+-    p->cached_subs.change_id = 0;
+-    p->cached_subs_valid = true;
++    p->mono->cached_has_color = split ? false : has_color;
++    *out = layer[0];
++    p->mono->cached_subs = layer[0];
++    p->mono->cached_subs.change_id = 0;
++    p->mono->cached_subs_valid = true;
++
++    if (split) {
++        *out_color = layer[1];
++        p->color->cached_subs = layer[1];
++        p->color->cached_subs.change_id = 0;
++        p->color->cached_subs_valid = true;
++    }
+ }
+ 
+ #if HAVE_SUBRANDR
+@@ -393,10 +450,10 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+ static bool pack_subrandr(struct mp_sub_packer *p, struct sub_bitmaps *res,
+                           struct sbr_instanced_raster_pass *pass)
+ {
+-    if (!pack(p, res, IMGFMT_BGRA))
++    if (!pack(p->mono, res, IMGFMT_BGRA))
+         return false;
+ 
+-    int padding = p->packer->padding;
++    int padding = p->mono->packer->padding;
+     sbr_bgra8 *base = (sbr_bgra8 *)res->packed->planes[0];
+     int byte_stride = res->packed->stride[0];
+     int pixel_stride = byte_stride / 4;
+@@ -419,8 +476,8 @@ static bool pack_subrandr(struct mp_sub_packer *p, struct sub_bitmaps *res,
+         if (!instance->base->user_data)
+             continue;
+ 
+-        MP_TARRAY_GROW(p, p->cached_parts, res->num_parts);
+-        res->parts = p->cached_parts;
++        MP_TARRAY_GROW(p->mono, p->mono->cached_parts, res->num_parts);
++        res->parts = p->mono->cached_parts;
+         struct sub_bitmap *inst_b = &res->parts[res->num_parts];
+         struct sub_bitmap *image_b = &p->cached_subrandr_images[(size_t)instance->base->user_data - 1];
+ 
+@@ -446,12 +503,12 @@ void mp_sub_packer_pack_sbr(struct mp_sub_packer *p, sbr_instanced_raster_pass *
+                             struct sub_bitmaps *out)
+ {
+     *out = (struct sub_bitmaps){.change_id = 1};
+-    p->cached_subs_valid = false;
++    p->mono->cached_subs_valid = false;
+ 
+     struct sub_bitmaps res = {
+-        .change_id = (unsigned)p->cached_subs.change_id + 1,
++        .change_id = (unsigned)p->mono->cached_subs.change_id + 1,
+         .format = SUBBITMAP_SUBRANDR,
+-        .parts = p->cached_parts,
++        .parts = p->mono->cached_parts,
+         .video_color_space = false,
+     };
+ 
+@@ -478,13 +535,13 @@ void mp_sub_packer_pack_sbr(struct mp_sub_packer *p, sbr_instanced_raster_pass *
+         return;
+ 
+     *out = res;
+-    p->cached_subs = res;
+-    p->cached_subs_valid = true;
++    p->mono->cached_subs = res;
++    p->mono->cached_subs_valid = true;
+ }
+ 
+ const struct sub_bitmaps *mp_sub_packer_get_cached(struct mp_sub_packer *p) {
+-    if (p->cached_subs_valid)
+-        return &p->cached_subs;
++    if (p->mono->cached_subs_valid)
++        return &p->mono->cached_subs;
+     return NULL;
+ }
+ #endif
+diff --git a/sub/packer.h b/sub/packer.h
+index b5ef41d..7504bf4 100644
+--- a/sub/packer.h
++++ b/sub/packer.h
+@@ -30,9 +30,15 @@
+ struct sub_bitmaps;
+ struct mp_sub_packer;
+ struct mp_sub_packer *mp_sub_packer_alloc(void *ta_parent);
++// Pack the ASS image lists into `out`. If `out_color` is non-NULL, color
++// bitmaps (color emoji) may be split out into their own BGRA layer there, which
++// leaves `out` in the cheap coverage format; it is then EMPTY if there is
++// nothing of its own to draw, and vice versa. Pass NULL to keep the old
++// behavior of one merged layer, where color bitmaps force `out` to BGRA.
+ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+                             int num_image_lists, bool changed, bool video_color_space,
+-                            int preferred_osd_format, struct sub_bitmaps *out);
++                            int preferred_osd_format, struct sub_bitmaps *out,
++                            struct sub_bitmaps *out_color);
+ 
+ #if HAVE_SUBRANDR
+ struct sbr_instanced_raster_pass;
+diff --git a/sub/sd.h b/sub/sd.h
+index d7cea26..35a8b3c 100644
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -50,6 +50,9 @@ struct sd_functions {
+ 
+     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
+                                        int format, double pts);
++    // Optional: the color-bitmap layer that get_bitmaps() split off for the
++    // same pts, or NULL if there is none. Ownership moves to the caller.
++    struct sub_bitmaps *(*get_color_bitmaps)(struct sd *sd);
+     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+     struct sd_times (*get_times)(struct sd *sd, double pts);
+     struct sub_lines *(*get_lines)(struct sd *sd);
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index db4d67d..dec4bd1 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -54,6 +54,7 @@ struct sd_ass_priv {
+     bool clear_once;
+     struct mp_sub_packer *packer;
+     struct sub_bitmap_copy_cache *copy_cache;
++    struct sub_bitmaps *color_layer; // split off by get_bitmaps, owned until read
+     bstr last_text;
+     struct mp_image_params video_params;
+     struct mp_image_params last_params;
+@@ -735,6 +736,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+     ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
+     ASS_Renderer *renderer = ctx->ass_renderer;
+     struct sub_bitmaps *res = &(struct sub_bitmaps){0};
++    struct sub_bitmaps color = {0};
+ 
+     // Always update the osd_res
+     struct mp_osd_res old_osd = ctx->osd;
+@@ -779,18 +781,37 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+ 
+     int changed;
+     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+-    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
++    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res,
++                           &color);
+ 
+ done:
+     // mangle_colors() modifies the color field, so copy the thing _before_.
+     res = sub_bitmaps_copy(&ctx->copy_cache, res);
+ 
++    // Kept for the OSDTYPE_SUB_COLOR object, which is rendered right after this
++    // in the same osd_render() pass and takes ownership when it reads it. The
++    // emoji colors were baked into that layer by the packer, so like before this
++    // split they are not mangled; what changes is that the text no longer loses
++    // mangling just because some emoji happens to be on screen.
++    talloc_free(ctx->color_layer);
++    ctx->color_layer = sub_bitmaps_copy(NULL, &color);
++
+     if (!converted && res)
+         mangle_colors(sd, res);
+ 
+     return res;
+ }
+ 
++// The layer get_bitmaps() split off for the same pts, or NULL. Ownership of the
++// returned item moves to the caller, so it can only be taken once per render.
++static struct sub_bitmaps *get_color_bitmaps(struct sd *sd)
++{
++    struct sd_ass_priv *ctx = sd->priv;
++    struct sub_bitmaps *res = ctx->color_layer;
++    ctx->color_layer = NULL;
++    return res;
++}
++
+ #define MAX_BUF_SIZE 1024 * 1024
+ #define MIN_EXPAND_SIZE 4096
+ 
+@@ -995,6 +1016,9 @@ static void fill_plaintext(struct sd *sd, double pts)
+ static void reset(struct sd *sd)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
++    // A layer left here belongs to a pts that no longer applies.
++    talloc_free(ctx->color_layer);
++    ctx->color_layer = NULL;
+     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
+         ass_flush_events(ctx->ass_track);
+         ctx->num_seen_packets = 0;
+@@ -1014,6 +1038,8 @@ static void uninit(struct sd *sd)
+         lavc_conv_uninit(ctx->converter);
+     assobjects_destroy(sd);
+     talloc_free(ctx->copy_cache);
++    talloc_free(ctx->color_layer);
++    ctx->color_layer = NULL;
+ }
+ 
+ static struct sub_lines *get_lines(struct sd *sd)
+@@ -1107,6 +1133,7 @@ const struct sd_functions sd_ass = {
+     .init = init,
+     .decode = decode,
+     .get_bitmaps = get_bitmaps,
++    .get_color_bitmaps = get_color_bitmaps,
+     .get_text = get_text,
+     .get_times = get_times,
+     .get_lines = get_lines,
+-- 
+2.51.2.windows.1
+
