@@ -1,0 +1,433 @@
+From 53f065dcc98914dd8370d7e0acece34fb9b2342e Mon Sep 17 00:00:00 2001
+From: yaozhi-local <local@localhost>
+Date: Sun, 1 Nov 2026 18:26:50 +0800
+Subject: [PATCH 2/2] render: draw color bitmap glyphs as their own images
+
+A glyph whose artwork is a color strike cannot be expressed as an 8-bit
+coverage map with a blend color: the outline path would only produce a
+monochrome silhouette, and for bitmap-only faces there is no outline to
+rasterize at all. Hand those glyphs to the client as IMAGE_TYPE_COLOR, a
+premultiplied BGRA image at the pen position, with the run's opacity in the
+alpha byte of color so that \alpha, \fade and \t still apply.
+
+Color glyphs are laid out from their strike (advance, bounding box and line
+height), get a run of their own because they cannot be merged into a shared
+alpha bitmap, and are drawn after the rest of the event so that they end up on
+top of whatever they overlap.
+
+Resampling is axis-aligned, so a transformed color glyph falls back to its
+outline; a face without one is drawn unrotated, which still beats showing
+nothing. Vector clipping is alpha-only, so color glyphs are clipped normally
+instead of being blended with the clip shape.
+---
+ libass/ass.h        |  17 +++-
+ libass/ass_render.c | 190 +++++++++++++++++++++++++++++++++++++++++++-
+ libass/ass_render.h |   4 +
+ libass/ass_shaper.c |   7 ++
+ 4 files changed, 212 insertions(+), 6 deletions(-)
+
+diff --git a/libass/ass.h b/libass/ass.h
+index 851ca7c..68ca44b 100644
+--- a/libass/ass.h
++++ b/libass/ass.h
+@@ -62,16 +62,24 @@ extern "C" {
+ typedef struct ass_image {
+     int w, h;                   // Bitmap width/height
+     int stride;                 // Bitmap stride
+-    unsigned char *bitmap;      // 1-byte-per-pixel alpha buffer
++    unsigned char *bitmap;      // 1-byte-per-pixel alpha buffer, or 4-byte
++                                // premultiplied BGRA pixels for
++                                // IMAGE_TYPE_COLOR
+                                 // Note: the last row may not be padded to
+                                 // bitmap stride!
+                                 // The guaranteed allocated size is
+                                 // `(stride * (h - 1)) + w`, and bytes past
+                                 // the width in each line may be uninitialized.
++                                // For IMAGE_TYPE_COLOR, stride is in bytes and
++                                // the guaranteed size is `stride * h` with all
++                                // bytes initialized.
+     uint32_t color;             // Bitmap color and alpha, RGBA
+                                 // For full VSFilter compatibility, the value
+                                 // must be transformed as described in
+                                 // ass_types.h for ASS_YCbCrMatrix
++                                // Ignored for IMAGE_TYPE_COLOR, except that the
++                                // alpha byte is still the opacity to blend the
++                                // image with.
+     int dst_x, dst_y;           // Bitmap placement inside the video frame
+ 
+     struct ass_image *next;   // Next image, or NULL
+@@ -79,7 +87,12 @@ typedef struct ass_image {
+     enum {
+         IMAGE_TYPE_CHARACTER,
+         IMAGE_TYPE_OUTLINE,
+-        IMAGE_TYPE_SHADOW
++        IMAGE_TYPE_SHADOW,
++        // Color glyph taken from a CBDT/CBLC or sbix strike. The bitmap holds
++        // premultiplied BGRA pixels, which must be blended over the frame with
++        // the usual source-over formula (no separate colour is applied) and
++        // scaled by the alpha byte of color.
++        IMAGE_TYPE_COLOR
+     } type;
+ 
+     // New fields can be added here in new ABI-compatible library releases.
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 18f856a..c0c86ca 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -137,12 +137,14 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+ 
+     priv->cache.font_cache = ass_font_cache_create();
+     priv->cache.bitmap_cache = ass_bitmap_cache_create();
++    priv->cache.color_cache = ass_color_cache_create();
+     priv->cache.composite_cache = ass_composite_cache_create();
+     priv->cache.outline_cache = ass_outline_cache_create();
+     priv->cache.face_size_metrics_cache = ass_face_size_metrics_cache_create();
+     priv->cache.metrics_cache = ass_glyph_metrics_cache_create();
+     if (!priv->cache.font_cache || !priv->cache.bitmap_cache ||
+-        !priv->cache.composite_cache || !priv->cache.outline_cache ||
++        !priv->cache.color_cache || !priv->cache.composite_cache ||
++        !priv->cache.outline_cache ||
+         !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
+         goto fail;
+ 
+@@ -182,6 +184,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
+ 
+     ass_cache_done(render_priv->cache.composite_cache);
+     ass_cache_done(render_priv->cache.bitmap_cache);
++    ass_cache_done(render_priv->cache.color_cache);
+     ass_cache_done(render_priv->cache.outline_cache);
+     ass_cache_done(render_priv->cache.face_size_metrics_cache);
+     ass_cache_done(render_priv->cache.metrics_cache);
+@@ -209,8 +212,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
+  */
+ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
+                                  int bitmap_h, int stride, int dst_x,
+-                                 int dst_y, uint32_t color,
+-                                 CompositeHashValue *source)
++                                 int dst_y, uint32_t color, void *source)
+ {
+     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
+     if (!img) {
+@@ -495,6 +497,58 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
+     return tail;
+ }
+ 
++/*
++ * \brief Add a color glyph to an image list
++ *
++ * The pixels are the artwork itself, so no colour, outline, shadow or
++ * karaoke effect is applied -- only the event opacity, which travels in
++ * the alpha byte of color. Inverse clipping is not supported and the glyph
++ * is drawn with normal clipping instead.
++ */
++static ASS_Image **
++render_color_glyph(RenderContext *state, ColorBitmap *bm, int dst_x, int dst_y,
++                   uint32_t color, ASS_Image **tail)
++{
++    ASS_Renderer *render_priv = state->renderer;
++    int b_x0, b_y0, b_x1, b_y1;   // visible part of the bitmap
++
++    dst_x += bm->left;
++    dst_y += bm->top;
++
++    int clip_x0 = FFMINMAX(state->clip_x0, 0, render_priv->width);
++    int clip_y0 = FFMINMAX(state->clip_y0, 0, render_priv->height);
++    int clip_x1 = FFMINMAX(state->clip_x1, 0, render_priv->width);
++    int clip_y1 = FFMINMAX(state->clip_y1, 0, render_priv->height);
++    b_x0 = b_y0 = 0;
++    b_x1 = bm->w;
++    b_y1 = bm->h;
++
++    int tmp = dst_x - clip_x0;
++    if (tmp < 0)
++        b_x0 = -tmp;
++    tmp = dst_y - clip_y0;
++    if (tmp < 0)
++        b_y0 = -tmp;
++    tmp = clip_x1 - dst_x - bm->w;
++    if (tmp < 0)
++        b_x1 = bm->w + tmp;
++    tmp = clip_y1 - dst_y - bm->h;
++    if (tmp < 0)
++        b_y1 = bm->h + tmp;
++
++    if (b_x0 >= b_x1 || b_y0 >= b_y1)
++        return tail;
++
++    ASS_Image *img = my_draw_bitmap(bm->buffer + (size_t) b_y0 * bm->stride + 4 * b_x0,
++                                    b_x1 - b_x0, b_y1 - b_y0, bm->stride,
++                                    dst_x + b_x0, dst_y + b_y0, color, bm);
++    if (!img)
++        return tail;
++    img->type = IMAGE_TYPE_COLOR;
++    *tail = img;
++    return &img->next;
++}
++
+ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+                                ASS_DVector *offset, bool first,
+                                BitmapHashKey *key)
+@@ -737,6 +791,9 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
+         int aleft, atop, bleft, btop;
+         unsigned char *abuffer, *bbuffer, *nbuffer;
+ 
++        if (cur->type == IMAGE_TYPE_COLOR)
++            continue;   // the clip is alpha-only
++
+         abuffer = cur->bitmap;
+         bbuffer = clip_bm->buffer;
+         ax = cur->dst_x;
+@@ -877,6 +934,22 @@ static ASS_Image *render_text(RenderContext *state)
+                              0, 1000000, tail, IMAGE_TYPE_CHARACTER, info->image);
+     }
+ 
++    // Color glyphs carry their own pixels and are never combined with other
++    // runs, so they go last and overwrite whatever they overlap.
++    for (unsigned i = 0; i < n_bitmaps; i++) {
++        CombinedBitmapInfo *info = &bitmaps[i];
++        if (!info->color)
++            continue;
++        if (_a(info->c[0]) == 0xFF)
++            continue;
++
++        // White with the run's opacity; the RGB part is ignored by consumers of
++        // a color bitmap, but a transparent alpha byte would drop the image.
++        uint32_t color = 0xFFFFFF00 | (info->c[0] & 0xFF);
++        tail = render_color_glyph(state, info->color, info->x, info->y,
++                                 color, tail);
++    }
++
+     *tail = 0;
+     blend_vector_clip(state, head);
+ 
+@@ -1193,6 +1266,34 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
+         asc = val->asc - desc;
+ 
+         offset.y = -asc * scale.y;
++    } else if (ass_font_is_color_only(info->font, info->face_index)) {
++        // A bitmap-only color face (CBDT/CBLC or sbix emoji) has no outlines to
++        // measure, only the strike itself. Its glyphs still have to take part in
++        // layout, so derive the box, the advance and the line height from it.
++        ColorStrike st;
++        FT_Glyph_Metrics gm;
++        if (!ass_font_get_color_strike(info->font, info->face_index, &st) ||
++                !ass_font_color_metrics(info->font, info->face_index,
++                                        info->glyph_index, info->font_size, &gm))
++            return;
++
++        info->transform.scale.x = info->scale_x;
++        info->transform.scale.y = info->scale_y;
++        info->transform.offset = offset;
++
++        info->bbox.x_min = ass_lrint(gm.horiBearingX * info->scale_x);
++        info->bbox.x_max = ass_lrint((gm.horiBearingX + gm.width) * info->scale_x);
++        info->bbox.y_min = ass_lrint(-gm.horiBearingY * info->scale_y);
++        info->bbox.y_max = ass_lrint((gm.height - gm.horiBearingY) * info->scale_y);
++        info->asc  = double_to_d6(st.asc * info->font_size * info->scale_y / st.height);
++        info->desc = double_to_d6(-st.desc * info->font_size * info->scale_y / st.height);
++
++        if (priv->settings.shaper == ASS_SHAPING_SIMPLE) {
++            info->cluster_advance.x = info->advance.x =
++                ass_lrint(gm.horiAdvance * info->scale_x);
++            info->cluster_advance.y = info->advance.y = 0;
++        }
++        return;
+     } else {
+         key.type = OUTLINE_GLYPH;
+         GlyphHashKey *k = &key.u.glyph;
+@@ -1379,6 +1480,7 @@ static void calc_transform_matrix(RenderContext *state,
+  * If they can't be found, they are generated by rotating and rendering the glyph.
+  * After that, bitmaps are added to the cache.
+  * They are returned in info->bm (glyph), info->bm_o (outline).
++ * Color fonts instead get a resampled bitmap strike in info->color.
+  */
+ static void
+ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+@@ -1388,7 +1490,9 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+ {
+     ASS_Renderer *render_priv = state->renderer;
+ 
+-    if (!info->outline || info->symbol == '\n' || info->symbol == 0 || info->skip)
++    info->color = NULL;
++
++    if (info->symbol == '\n' || info->symbol == 0 || info->skip)
+         return;
+ 
+     double m1[3][3], m2[3][3], m[3][3];
+@@ -1401,6 +1505,60 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+     }
+     memcpy(m, m2, sizeof(m));
+ 
++    // An embedded bitmap strike is the actual artwork of a color glyph, while
++    // its outline would only be a monochrome silhouette (or, for bitmap-only
++    // faces such as CBDT/CBLC emoji fonts, there is no outline at all).
++    // Resampling is axis-aligned only, so a rotated, skewed or projected
++    // scalable glyph falls back to its outline; a face without one is drawn
++    // unrotated, which still beats showing nothing.
++    bool axis_aligned = !m2[0][1] && !m2[1][0] && !m2[2][0] && !m2[2][1];
++    int color_h = !info->drawing_text.str && (axis_aligned || !info->outline) ?
++            ass_font_color_height(info->font, info->face_index) : 0;
++    if (color_h) {
++        // The strike's line height corresponds to the face size that the
++        // outline path would have requested, so this is device pixels per
++        // strike pixel. Scale in 1/256 steps so that animating the size does
++        // not resample every frame, and the pen's fractional part in 1/4 pixel
++        // steps, which the resample folds into the filter.
++        const double scale_step = 256, sub_step = 16;
++        ASS_Vector pen = {
++            .x = info->pos.x >> 6,
++            .y = info->pos.y >> 6,
++        };
++        int sub_x = lrint((info->pos.x - (pen.x << 6)) / sub_step) * sub_step;
++        int sub_y = lrint((info->pos.y - (pen.y << 6)) / sub_step) * sub_step;
++        pen.x += sub_x >> 6;
++        pen.y += sub_y >> 6;
++        sub_x &= 63;
++        sub_y &= 63;
++
++        ColorGlyphHashKey c_key = {
++            .font = info->font,
++            .scale_x = lrint((double) info->font_size * tr->scale.x *
++                             render_priv->par_scale_x * scale_step / color_h) / scale_step,
++            .scale_y = lrint((double) info->font_size * tr->scale.y *
++                             scale_step / color_h) / scale_step,
++            .face_index = info->face_index,
++            .glyph_index = info->glyph_index,
++            .sub_x = sub_x,
++            .sub_y = sub_y,
++        };
++        ColorBitmap *cbm =
++            ass_cache_get(render_priv->cache.color_cache, &c_key, render_priv);
++        if (cbm && cbm->buffer) {
++            info->color = cbm;
++            info->bm = info->bm_o = NULL;
++            *pos = *pos_o = pen;
++            return;
++        }
++        // no strike for this particular glyph: fall back to its outline
++        if (!info->outline)
++            return;
++    }
++
++    if (!info->outline)
++        return;
++
+     if (info->effect_type == EF_KARAOKE_KF)
+         ass_outline_update_min_transformed_x(&info->outline->outline[0], m, leftmost_x);
+ 
+@@ -2486,6 +2644,12 @@ static void render_and_combine_glyphs(RenderContext *state,
+                 info->border_style == 3)
+                 flags |= FILTER_FILL_IN_BORDER;
+ 
++            // Color strikes are copied to the screen verbatim and cannot be
++            // merged into a run's alpha bitmap, so each gets a run of its own.
++            if (!info->drawing_text.str &&
++                ass_font_color_height(info->font, info->face_index))
++                new_run = true;
++
+             if (new_run) {
+                 if (nb_bitmaps >= text_info->max_bitmaps) {
+                     size_t new_size = 2 * text_info->max_bitmaps;
+@@ -2525,6 +2689,7 @@ static void render_and_combine_glyphs(RenderContext *state,
+ 
+                 current_info->x = current_info->y = INT_MAX;
+                 current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
++                current_info->color = NULL;
+                 current_info->image = NULL;
+ 
+                 current_info->bitmap_count = current_info->max_bitmap_count = 0;
+@@ -2545,6 +2710,16 @@ static void render_and_combine_glyphs(RenderContext *state,
+             get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
+                              &offset, !current_info->bitmap_count, flags);
+ 
++            if (info->color) {
++                current_info->color = info->color;
++                current_info->x = pos.x;
++                current_info->y = pos.y;
++                // The run holds the strike alone: its bitmaps are not part of
++                // the composite, so nothing else may be merged into it.
++                new_run = true;
++                continue;
++            }
++
+             if (!info->bm && !info->bm_o)
+                 continue;
+ 
+@@ -2568,6 +2743,12 @@ static void render_and_combine_glyphs(RenderContext *state,
+ 
+     for (int i = 0; i < nb_bitmaps; i++) {
+         CombinedBitmapInfo *info = &combined_info[i];
++        if (info->color) {
++            // Drawn straight from the strike cache; nothing to composite.
++            free(info->bitmaps);
++            info->bitmaps = NULL;
++            continue;
++        }
+         if (!info->bitmap_count) {
+             free(info->bitmaps);
+             continue;
+@@ -3022,6 +3203,7 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
+ {
+     ass_cache_cut(cache->composite_cache, cache->composite_max_size);
+     ass_cache_cut(cache->bitmap_cache, cache->bitmap_max_size);
++    ass_cache_cut(cache->color_cache, COLOR_CACHE_MAX_SIZE);
+     ass_cache_cut(cache->outline_cache, cache->glyph_max);
+ }
+ 
+diff --git a/libass/ass_render.h b/libass/ass_render.h
+index e1eb7d2..351ffb8 100644
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -45,6 +45,7 @@
+ #define BITMAP_CACHE_MAX_SIZE (128 * MEGABYTE)
+ #define COMPOSITE_CACHE_RATIO 2
+ #define COMPOSITE_CACHE_MAX_SIZE (BITMAP_CACHE_MAX_SIZE / COMPOSITE_CACHE_RATIO)
++#define COLOR_CACHE_MAX_SIZE (32 * MEGABYTE)
+ 
+ #define PARSED_FADE (1<<0)
+ #define PARSED_A    (1<<1)
+@@ -114,6 +115,7 @@ typedef struct {
+ 
+     int x, y;
+     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps
++    ColorBitmap *color;         // set instead of bm/bm_o for color fonts
+     CompositeHashValue *image;
+ } CombinedBitmapInfo;
+ 
+@@ -175,6 +177,7 @@ typedef struct glyph_info {
+ 
+     ASS_Vector shift;
+     Bitmap *bm, *bm_o;
++    ColorBitmap *color;         // color strike, drawn instead of bm/bm_o
+ 
+     // next glyph in this cluster
+     struct glyph_info *next;
+@@ -300,6 +303,7 @@ typedef struct {
+     Cache *font_cache;
+     Cache *outline_cache;
+     Cache *bitmap_cache;
++    Cache *color_cache;
+     Cache *composite_cache;
+     Cache *face_size_metrics_cache;
+     Cache *metrics_cache;
+diff --git a/libass/ass_shaper.c b/libass/ass_shaper.c
+index d733d5d..e677602 100644
+--- a/libass/ass_shaper.c
++++ b/libass/ass_shaper.c
+@@ -260,6 +260,13 @@ size_t ass_glyph_metrics_construct(void *key, void *value, void *priv)
+ 
+     ass_face_set_size(face, k->size);
+ 
++    // A bitmap-only color face has no outlines and FreeType cannot scale it,
++    // so take the advance and bearings from the strike itself.
++    if (ass_font_is_color_only(k->font, k->face_index) &&
++        ass_font_color_metrics(k->font, k->face_index, k->glyph_index,
++                               k->size, v))
++        return 1;
++
+     if (FT_Load_Glyph(face, k->glyph_index, load_flags)) {
+         v->width = -1;
+         return 1;
+-- 
+2.51.2.windows.1
+

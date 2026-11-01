@@ -2,6 +2,8 @@ name: "Build V1.0.0 main and Atmos parity candidates"
 
 on:
   workflow_dispatch:
+  push:
+    branches: [color-emoji-build]
   pull_request:
     branches: [codex/v100-core-parity-20260907]
     paths:
@@ -243,6 +245,48 @@ jobs:
           text = text.replace(cleanup, "# cppwinrt cleanup is deferred\n", 1)
           cppwinrt.write_text(text)
           PY
+
+          # Color emoji: libass must read the CBDT/CBLC strike a color font
+          # carries and hand the pixels back as their own image; mpv must then
+          # pack those as premultiplied BGRA instead of tinting a coverage map.
+          # Upstream libass is not pinned here, so pin the base these patches
+          # were generated against to keep `git am --3way` applicable.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          LIBASS_COMMIT = "00fe2ec7ae677b7568fbbcbcbcb67d34bb4292a3"
+
+          path = Path("packages/libass.cmake")
+          text = path.read_text()
+
+          tag = f"    GIT_TAG {LIBASS_COMMIT}\n"
+          if tag not in text:
+              anchor = "    GIT_REPOSITORY https://github.com/libass/libass.git\n"
+              if anchor not in text:
+                  raise SystemExit("Could not locate libass repository anchor")
+              text = text.replace(anchor, anchor + tag, 1)
+
+          if "libass-*.patch" not in text:
+              anchor = '    UPDATE_COMMAND ""\n'
+              if anchor not in text:
+                  raise SystemExit("Could not locate libass update anchor")
+              text = text.replace(
+                  anchor,
+                  anchor
+                  + "    PATCH_COMMAND ${EXEC} git am --3way "
+                    "${CMAKE_CURRENT_SOURCE_DIR}/libass-*.patch\n",
+                  1,
+              )
+
+          path.write_text(text)
+          PY
+
+          color_emoji="$GITHUB_WORKSPACE/build/color-emoji"
+          cp "$color_emoji/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch" \
+            packages/
+          cp "$color_emoji/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch" \
+            packages/
+          cp "$color_emoji/mpv-9100-color-emoji-bgra.patch" packages/
 
           # Apply the single audited c318236 candidate mailbox. It
           # contains only the sixteen consecutive audited commits from the isolated
@@ -495,6 +539,21 @@ jobs:
             packages/sdl2-9001-spatial-channel-counts.patch
           grep -Fq 'orig->channels != 12' \
             packages/sdl2-9001-spatial-channel-counts.patch
+          grep -Fq "GIT_TAG 00fe2ec7ae677b7568fbbcbcbcb67d34bb4292a3" packages/libass.cmake
+          grep -n 'PATCH_COMMAND.*libass-' packages/libass.cmake
+          grep -Fq 'ass_font_get_color_strike' \
+            packages/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch
+          grep -Fq 'IMAGE_TYPE_COLOR' \
+            packages/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch
+          grep -Fq 'draw_ass_color' packages/mpv-9100-color-emoji-bgra.patch
+          grep -Fq 'is_color' packages/mpv-9100-color-emoji-bgra.patch
+          # The candidate mailbox must not touch the subtitle packing this
+          # patch depends on; both series are applied to the same tree.
+          if grep -Fq 'diff --git a/sub/packer.c' \
+            packages/mpv-9000-candidate-c318236.patch; then
+            echo "::error::candidate mpv patch overlaps the color emoji patch"
+            exit 1
+          fi
           if grep -E 'list\(APPEND removed .*"curl"' packages/CMakeLists.txt; then
             echo "::error::curl is still excluded from the mpv dependency graph"
             exit 1

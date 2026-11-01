@@ -1,0 +1,176 @@
+From f369ed8202bcf4556d45d9dd554e5a560dd8de15 Mon Sep 17 00:00:00 2001
+From: yaozhi-local <local@localhost>
+Date: Sun, 1 Nov 2026 18:23:38 +0800
+Subject: [PATCH] sub: render libass color bitmaps (color emoji) as
+ premultiplied BGRA
+
+libass can now hand back glyphs whose artwork is an embedded color bitmap
+(IMAGE_TYPE_COLOR, premultiplied BGRA) instead of an 8-bit coverage map plus
+a blend color. The ASS packing ignored the image type entirely, so such
+bitmaps came out as a monochrome silhouette.
+
+Pass the type through to struct sub_bitmap, and let the presence of a color
+bitmap force the RGBA packing, which already exists for image-based subtitles
+and for force_rgba_osd. Color parts are blended with their own pixels, scaled
+by the run's opacity, instead of tinting a coverage map with the blend color.
+---
+ sub/osd.h    |  4 +++
+ sub/packer.c | 74 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/sub/osd.h b/sub/osd.h
+index b62836e..6793587 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -54,6 +54,10 @@ struct sub_bitmap {
+     union {
+         struct {
+             uint32_t color;
++            // The bitmap is a premultiplied BGRA image instead of an 8-bit
++            // coverage map, i.e. libass reported it as IMAGE_TYPE_COLOR. Only
++            // set before packing; packed output is always BGRA.
++            bool is_color;
+         } libass;
+         struct {
+             const struct sbr_output_image *image;
+diff --git a/sub/packer.c b/sub/packer.c
+index bebb456..033fe66 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -43,6 +43,7 @@ struct mp_sub_packer {
+     struct mp_image *cached_img;
+     struct sub_bitmaps cached_subs;
+     bool cached_subs_valid;
++    bool cached_has_color; // cached_subs was packed as BGRA for color bitmaps
+     struct sub_bitmap rgba_imgs[MP_SUB_BB_LIST_MAX];
+     struct bitmap_packer *packer;
+ };
+@@ -184,6 +185,46 @@ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
+     }
+ }
+ 
++// Blend a premultiplied BGRA bitmap over the destination. libass uses this for
++// glyphs whose artwork is a color bitmap, i.e. color emoji, which have no
++// coverage map to tint with a blend color. As in draw_ass_rgba(), the low byte
++// of `color` is the run's transparency, so the whole bitmap is faded by it.
++static void draw_ass_color(unsigned char *src, int src_w, int src_h,
++                           int src_stride, unsigned char *dst, size_t dst_stride,
++                           int dst_x, int dst_y, uint32_t color)
++{
++    const unsigned int a = 0xff - (color & 0xff);
++
++    if (!a)
++        return;
++
++    dst += dst_y * dst_stride + dst_x * 4;
++
++    for (int y = 0; y < src_h; y++, dst += dst_stride, src += src_stride) {
++        uint32_t *dstrow = (uint32_t *) dst;
++        const uint32_t *srcrow = (const uint32_t *) src;
++        for (int x = 0; x < src_w; x++) {
++            const uint32_t srcpix = srcrow[x];
++            const unsigned int aa = ((srcpix >> 24) & 0xff) * a;
++            if (!aa)
++                continue;
++            unsigned int dstpix = dstrow[x];
++            unsigned int dstb =  dstpix        & 0xFF;
++            unsigned int dstg = (dstpix >>  8) & 0xFF;
++            unsigned int dstr = (dstpix >> 16) & 0xFF;
++            unsigned int dsta = (dstpix >> 24) & 0xFF;
++            const unsigned int inv = 255 * 255 - aa;
++            // The source is premultiplied already, so scaling its channels by
++            // the run opacity is enough; 255 keeps the units of draw_ass_rgba().
++            dstb = ((srcpix        & 0xFF) * a * 255 + dstb * inv) / (255 * 255);
++            dstg = ((srcpix >>  8  & 0xFF) * a * 255 + dstg * inv) / (255 * 255);
++            dstr = ((srcpix >> 16  & 0xFF) * a * 255 + dstr * inv) / (255 * 255);
++            dsta = (         aa * 255      + dsta * inv) / (255 * 255);
++            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
++        }
++    }
++}
++
+ static bool pack_libass(struct mp_sub_packer *p, struct sub_bitmaps *res)
+ {
+     if (!pack(p, res, IMGFMT_Y8))
+@@ -252,10 +293,16 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
+                 s->y >= b->y + b->h || s->y + s->h <= b->y)
+                 continue;
+ 
+-            draw_ass_rgba(s->bitmap, s->w, s->h, s->stride,
+-                          b->bitmap, b->stride,
+-                          s->x - b->x, s->y - b->y,
+-                          s->libass.color);
++            if (s->libass.is_color) {
++                draw_ass_color(s->bitmap, s->w, s->h, s->stride,
++                               b->bitmap, b->stride,
++                               s->x - b->x, s->y - b->y, s->libass.color);
++            } else {
++                draw_ass_rgba(s->bitmap, s->w, s->h, s->stride,
++                              b->bitmap, b->stride,
++                              s->x - b->x, s->y - b->y,
++                              s->libass.color);
++            }
+         }
+         fill_padding_4(b->bitmap, b->w, b->h, b->stride, padding);
+     }
+@@ -268,13 +315,19 @@ static bool pack_rgba(struct mp_sub_packer *p, struct sub_bitmaps *res)
+ // a single image, and make *out point to it. *out is completely overwritten.
+ // If libass reported any change, image_lists_changed must be set (it then
+ // repacks all images). preferred_osd_format can be set to a desired
+-// sub_bitmap_format. Currently, only SUBBITMAP_LIBASS is supported.
++// sub_bitmap_format; SUBBITMAP_LIBASS is used unless the images contain color
++// bitmaps, which need SUBBITMAP_BGRA.
+ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+                         int num_image_lists, bool image_lists_changed, bool video_color_space,
+                         int preferred_osd_format, struct sub_bitmaps *out)
+ {
+-    int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
+-                                                        : SUBBITMAP_LIBASS;
++    // Color bitmaps carry their own pixels, which the libass format (8-bit
++    // coverage plus a blend color) cannot express, so their presence forces
++    // packing as BGRA. Whether the list has any only depends on its contents,
++    // and the cache is only reused when those did not change, so consulting the
++    // cached value here is enough to decide on a cache hit.
++    int format = (preferred_osd_format == SUBBITMAP_BGRA || p->cached_has_color) ?
++                     SUBBITMAP_BGRA : SUBBITMAP_LIBASS;
+ 
+     if (p->cached_subs_valid && !image_lists_changed &&
+         p->cached_subs.format == format)
+@@ -293,6 +346,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+         .video_color_space = video_color_space,
+     };
+ 
++    bool has_color = false;
+     for (int n = 0; n < num_image_lists; n++) {
+         for (struct ass_image *img = image_lists[n]; img; img = img->next) {
+             if (img->w == 0 || img->h == 0)
+@@ -303,6 +357,8 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+             b->bitmap = img->bitmap;
+             b->stride = img->stride;
+             b->libass.color = img->color;
++            b->libass.is_color = img->type == IMAGE_TYPE_COLOR;
++            has_color |= b->libass.is_color;
+             b->dw = b->w = img->w;
+             b->dh = b->h = img->h;
+             b->x = img->dst_x;
+@@ -311,6 +367,9 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+         }
+     }
+ 
++    if (has_color)
++        format = SUBBITMAP_BGRA;
++
+     bool r = false;
+     if (format == SUBBITMAP_BGRA) {
+         r = pack_rgba(p, &res);
+@@ -321,6 +380,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
+     if (!r)
+         return;
+ 
++    p->cached_has_color = has_color;
+     *out = res;
+     p->cached_subs = res;
+     p->cached_subs.change_id = 0;
+-- 
+2.51.2.windows.1
+
