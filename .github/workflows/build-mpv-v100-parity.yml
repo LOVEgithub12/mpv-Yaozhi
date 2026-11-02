@@ -1417,6 +1417,18 @@ jobs:
             --source "$winbuild/src_packages/mpv" --cc /usr/bin/cc \
             --output "native-refresh-compiled-contract-${{ matrix.variant }}.json"
 
+      # The preflight upload runs before the build, so it can only ever carry the
+      # source binding. Without this step the binary-to-source proof exists only as
+      # a green job and the bound digests cannot be re-read later.
+      - name: Upload color emoji compiled layer evidence
+        if: always() && hashFiles('color-emoji-compiled-source-*.json') != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: mpv-color-emoji-compiled-layer-${{ matrix.variant }}
+          path: color-emoji-compiled-source-${{ matrix.variant }}.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Bind compiled rendering dependency and source snapshots
         if: steps.build.outcome == 'success'
         shell: bash
