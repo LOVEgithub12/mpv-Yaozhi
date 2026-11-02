@@ -1,0 +1,388 @@
+From 7d6f4a87f7f543d9c2f78885e47218269b9dd492 Mon Sep 17 00:00:00 2001
+From: yaozhi-local <local@localhost>
+Date: Sun, 1 Nov 2026 18:26:50 +0800
+Subject: [PATCH 1/2] font: read and resample embedded color bitmaps
+
+CBDT/CBLC and sbix faces store a glyph's artwork as a color bitmap at a fixed
+resolution, which FreeType hands out only at that exact size. Add the plumbing
+to fetch it: the strike of a face, its metrics for a requested em, and a
+resample of the glyph into device pixels.
+
+The resample is a box filter over premultiplied BGRA, which keeps a downscaled
+strike from aliasing and lets the fractional part of the pen position be folded
+into the filter weights instead of shifting the image. Results are cached per
+font, scale, glyph and quarter-pixel pen phase, so scrolling text does not
+resample every frame.
+
+Faces that have no outlines at all are now registered too, since for them the
+strike is the only thing worth drawing.
+---
+ libass/ass_cache.c          |  37 +++++++
+ libass/ass_cache.h          |   1 +
+ libass/ass_cache_template.h |  12 +++
+ libass/ass_font.c           | 198 ++++++++++++++++++++++++++++++++++++
+ libass/ass_font.h           |  29 ++++++
+ libass/ass_fontselect.c     |   6 +-
+ 6 files changed, 281 insertions(+), 2 deletions(-)
+
+diff --git a/libass/ass_cache.c b/libass/ass_cache.c
+index 47069c1..b00e343 100644
+--- a/libass/ass_cache.c
++++ b/libass/ass_cache.c
+@@ -325,6 +325,38 @@ const CacheDesc glyph_metrics_cache_desc = {
+ };
+ 
+ 
++// color bitmap cache
++static bool color_key_move(void *dst, void *src)
++{
++    ColorGlyphHashKey *d = dst, *s = src;
++    if (!d)
++        return true;
++
++    *d = *s;
++    ass_cache_inc_ref(s->font);
++    return true;
++}
++
++static void color_destruct(void *key, void *value)
++{
++    ColorGlyphHashKey *k = key;
++    ass_font_clear_color(value);
++    ass_cache_dec_ref(k->font);
++}
++
++size_t ass_color_construct(void *key, void *value, void *priv);
++
++const CacheDesc color_cache_desc = {
++    .hash_func = color_glyph_hash,
++    .compare_func = color_glyph_compare,
++    .key_move_func = color_key_move,
++    .construct_func = ass_color_construct,
++    .destruct_func = color_destruct,
++    .key_size = sizeof(ColorGlyphHashKey),
++    .value_size = sizeof(ColorBitmap)
++};
++
++
+ 
+ // Cache data
+ typedef struct cache_item {
+@@ -570,6 +602,11 @@ Cache *ass_bitmap_cache_create(void)
+     return ass_cache_create(&bitmap_cache_desc);
+ }
+ 
++Cache *ass_color_cache_create(void)
++{
++    return ass_cache_create(&color_cache_desc);
++}
++
+ Cache *ass_composite_cache_create(void)
+ {
+     return ass_cache_create(&composite_cache_desc);
+diff --git a/libass/ass_cache.h b/libass/ass_cache.h
+index 53eac20..11f3df2 100644
+--- a/libass/ass_cache.h
++++ b/libass/ass_cache.h
+@@ -111,6 +111,7 @@ Cache *ass_outline_cache_create(void);
+ Cache *ass_face_size_metrics_cache_create(void);
+ Cache *ass_glyph_metrics_cache_create(void);
+ Cache *ass_bitmap_cache_create(void);
++Cache *ass_color_cache_create(void);
+ Cache *ass_composite_cache_create(void);
+ 
+ #endif                          /* LIBASS_CACHE_H */
+diff --git a/libass/ass_cache_template.h b/libass/ass_cache_template.h
+index 84d6f4c..78fb4d4 100644
+--- a/libass/ass_cache_template.h
++++ b/libass/ass_cache_template.h
+@@ -95,6 +95,18 @@ START(glyph, glyph_hash_key)
+     GENERIC(unsigned, flags) // glyph decoration flags
+ END(GlyphHashKey)
+ 
++// describes a color bitmap of a glyph, resampled from a CBDT/CBLC or sbix strike
++// font is refed when inserted and unrefed when dropped
++START(color_glyph, color_glyph_hash_key)
++    GENERIC(ASS_Font *, font)
++    GENERIC(double, scale_x) // device pixels per strike pixel
++    GENERIC(double, scale_y)
++    GENERIC(int, face_index)
++    GENERIC(int, glyph_index)
++    GENERIC(int, sub_x)      // fractional pen position in d6, baked into the resample
++    GENERIC(int, sub_y)
++END(ColorGlyphHashKey)
++
+ // describes an outline drawing
+ // on call to ass_cache_get(), text is a non-owning view;
+ // its content is duplicated when inserted; the copy is freed when dropped
+diff --git a/libass/ass_font.c b/libass/ass_font.c
+index e5f9d44..700fd3c 100644
+--- a/libass/ass_font.c
++++ b/libass/ass_font.c
+@@ -812,6 +812,204 @@ bool ass_font_get_glyph(ASS_Font *font, int face_index, int index,
+     return true;
+ }
+ 
++/**
++ * \brief Index of the largest embedded color strike (CBDT/CBLC or sbix), or -1
++ * if the face has none. Such bitmaps cannot be scaled by FreeType, so the
++ * largest one is the best source: downscaling loses less than upscaling.
++ */
++static int color_strike_index(FT_Face face)
++{
++    if (!face || !FT_HAS_COLOR(face))
++        return -1;
++
++    int best = -1;
++    for (int i = 0; i < face->num_fixed_sizes; i++) {
++        if (face->available_sizes[i].height <= 0)
++            continue;
++        if (best < 0 ||
++            face->available_sizes[i].height > face->available_sizes[best].height)
++            best = i;
++    }
++    return best;
++}
++
++/**
++ * \brief Line height of the largest color strike of a face in its own pixels,
++ * i.e. the resolution the artwork is stored at. Zero for faces without color
++ * bitmaps, which is what callers use to recognize a color font.
++ */
++int ass_font_color_height(ASS_Font *font, int face_index)
++{
++    if (face_index < 0 || face_index >= font->n_faces)
++        return 0;
++    FT_Face face = font->faces[face_index];
++    int index = color_strike_index(face);
++    return index < 0 ? 0 : face->available_sizes[index].height;
++}
++
++bool ass_font_get_color_strike(ASS_Font *font, int face_index, ColorStrike *st)
++{
++    if (face_index < 0 || face_index >= font->n_faces)
++        return false;
++    FT_Face face = font->faces[face_index];
++    int index = color_strike_index(face);
++    if (index < 0 || FT_Select_Size(face, index))
++        return false;
++
++    st->index = index;
++    st->height = face->available_sizes[index].height;
++    st->width = face->available_sizes[index].width;
++    st->asc  = (face->size->metrics.ascender  + 32) >> 6;
++    st->desc = (face->size->metrics.descender + 32) >> 6;
++    return true;
++}
++
++bool ass_font_is_color_only(ASS_Font *font, int face_index)
++{
++    if (face_index < 0 || face_index >= font->n_faces)
++        return false;
++    FT_Face face = font->faces[face_index];
++    return face && FT_HAS_COLOR(face) && !FT_IS_SCALABLE(face) &&
++        color_strike_index(face) >= 0;
++}
++
++/**
++ * \brief Metrics of a color glyph, derived from its strike. FreeType cannot
++ * scale a bitmap-only face, so it reports metrics relative to the strike's own
++ * resolution; `size` is the requested em, which we identify with the strike
++ * line height (the same convention the resample uses for the artwork itself).
++ */
++bool ass_font_color_metrics(ASS_Font *font, int face_index, int glyph_index,
++                            double size, FT_Glyph_Metrics *m)
++{
++    ColorStrike st;
++    if (!ass_font_get_color_strike(font, face_index, &st))
++        return false;
++    FT_Face face = font->faces[face_index];
++    if (FT_Load_Glyph(face, glyph_index,
++                      FT_LOAD_COLOR | FT_LOAD_NO_HINTING |
++                      FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH |
++                      FT_LOAD_IGNORE_TRANSFORM))
++        return false;
++
++    const FT_Glyph_Metrics *src = &face->glyph->metrics;
++    double f = size / st.height;
++    memset(m, 0, sizeof(*m));
++    m->horiAdvance = lrint(src->horiAdvance * f);
++    m->vertAdvance = m->horiAdvance;
++    m->horiBearingX = lrint(src->horiBearingX * f);
++    m->horiBearingY = lrint(src->horiBearingY * f);
++    m->width  = lrint(src->width * f);
++    m->height = lrint(src->height * f);
++    if (face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
++        m->horiBearingX = lrint((double) face->glyph->bitmap_left * 64 * f);
++        m->horiBearingY = lrint((double) face->glyph->bitmap_top * 64 * f);
++        m->width  = lrint((double) face->glyph->bitmap.width * 64 * f);
++        m->height = lrint((double) face->glyph->bitmap.rows * 64 * f);
++    }
++    return true;
++}
++
++void ass_font_clear_color(ColorBitmap *bm)
++{
++    ass_aligned_free(bm->buffer);
++    bm->buffer = NULL;
++}
++
++// Box filter over premultiplied BGRA: premultiplied values average linearly,
++// and a box filter keeps downscaled strikes from aliasing the way bilinear
++// sampling would. sub_x and sub_y are the fractional part of the pen position;
++// folding them into the filter is what gives color glyphs subpixel placement
++// without resampling them again.
++static bool resample_color(const FT_Bitmap *src, ColorBitmap *dst,
++                           double sx, double sy, int left, int top,
++                           double sub_x, double sub_y)
++{
++    const int max_size = 8192;
++
++    double ox = left * sx + sub_x;
++    double oy = -top * sy + sub_y;  // FreeType counts upwards from the baseline
++    int x0 = (int) floor(ox);
++    int y0 = (int) floor(oy);
++    int w = (int) ceil(ox + src->width * sx) - x0;
++    int h = (int) ceil(oy + src->rows * sy) - y0;
++    if (w <= 0 || h <= 0 || w > max_size || h > max_size)
++        return false;
++
++    size_t stride = ass_align(16, (size_t) w * 4);
++    if (stride > (size_t) INT_MAX / (size_t) FFMAX(h, 1))
++        return false;
++    unsigned char *buf = ass_aligned_alloc(16, stride * h + 16, true);
++    if (!buf)
++        return false;
++
++    double gain = sx * sy;
++    for (int y = 0; y < h; y++) {
++        double fy0 = (y0 + y - oy) / sy, fy1 = fy0 + 1.0 / sy;
++        int iy0 = FFMAX((int) floor(fy0), 0);
++        int iy1 = FFMIN((int) ceil(fy1), (int) src->rows);
++        for (int x = 0; x < w; x++) {
++            double fx0 = (x0 + x - ox) / sx, fx1 = fx0 + 1.0 / sx;
++            int ix0 = FFMAX((int) floor(fx0), 0);
++            int ix1 = FFMIN((int) ceil(fx1), (int) src->width);
++            double acc[4] = {0};
++            for (int iy = iy0; iy < iy1; iy++) {
++                double wy = FFMIN(iy + 1, fy1) - FFMAX(iy, fy0);
++                const unsigned char *row = src->buffer + (ptrdiff_t) iy * src->pitch;
++                for (int ix = ix0; ix < ix1; ix++) {
++                    double wx = FFMIN(ix + 1, fx1) - FFMAX(ix, fx0);
++                    double k = wx * wy * gain;
++                    const unsigned char *px = row + (ptrdiff_t) ix * 4;
++                    for (int c = 0; c < 4; c++)
++                        acc[c] += px[c] * k;
++                }
++            }
++            unsigned char *out = buf + (ptrdiff_t) y * stride + (ptrdiff_t) x * 4;
++            for (int c = 0; c < 4; c++)
++                out[c] = FFMINMAX((int) lrint(acc[c]), 0, 255);
++        }
++    }
++
++    dst->buffer = buf;
++    dst->w = w;
++    dst->h = h;
++    dst->stride = (int) stride;
++    dst->left = x0;
++    dst->top = y0;
++    return true;
++}
++
++size_t ass_color_construct(void *key, void *value, void *priv)
++{
++    ColorGlyphHashKey *k = key;
++    ColorBitmap *bm = value;
++    memset(bm, 0, sizeof(*bm));
++
++    if (!k->scale_x || !k->scale_y)
++        return 1;
++    ColorStrike strike;
++    if (!ass_font_get_color_strike(k->font, k->face_index, &strike))
++        return 1;
++    FT_Face face = k->font->faces[k->face_index];
++    if (FT_Load_Glyph(face, k->glyph_index,
++                      FT_LOAD_COLOR | FT_LOAD_NO_HINTING |
++                      FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH |
++                      FT_LOAD_IGNORE_TRANSFORM))
++        return 1;
++
++    FT_Bitmap *src = &face->glyph->bitmap;
++    if (src->pixel_mode != FT_PIXEL_MODE_BGRA || !src->width || !src->rows ||
++        src->pitch < (long) src->width * 4)
++        return 1;    // no color strike for this glyph, fall back to outlines
++
++    if (!resample_color(src, bm, k->scale_x, k->scale_y,
++                        face->glyph->bitmap_left, face->glyph->bitmap_top,
++                        k->sub_x / 64.0, k->sub_y / 64.0))
++        return 1;
++
++    return (size_t) bm->stride * bm->h;
++}
++
+ /**
+  * \brief Deallocate ASS_Font internals
+  **/
+diff --git a/libass/ass_font.h b/libass/ass_font.h
+index 2388249..db6d417 100644
+--- a/libass/ass_font.h
++++ b/libass/ass_font.h
+@@ -49,8 +49,37 @@ struct ass_font {
+     int n_faces;
+ };
+ 
++// A color glyph taken from an embedded bitmap strike (CBDT/CBLC or sbix).
++// Pixels are premultiplied BGRA, already resampled to device resolution.
++typedef struct {
++    int w, h;               // bitmap size in device pixels
++    int stride;             // bytes per row
++    unsigned char *buffer;  // premultiplied BGRA, owned by the cache item
++    int left, top;          // top-left corner relative to the pen, y downwards
++} ColorBitmap;
++
++// The strike itself, in its own pixels. Color bitmaps are stored at fixed
++// resolutions and FreeType has no scaler for them, so a glyph can only be
++// loaded at exactly this size and has to be resampled afterwards.
++typedef struct {
++    int index;              // index in face->available_sizes
++    int height;             // strike line height == the size of the artwork
++    int width;              // widest glyph box of the strike
++    int asc, desc;          // baseline extents, desc is negative
++} ColorStrike;
++
+ void ass_charmap_magic(ASS_Library *library, FT_Face face);
+ ASS_Font *ass_font_new(ASS_Renderer *render_priv, ASS_FontDesc *desc);
++bool ass_font_get_color_strike(ASS_Font *font, int face_index, ColorStrike *st);
++int ass_font_color_height(ASS_Font *font, int face_index);
++// True for faces whose artwork is only the embedded color strike, i.e. there
++// are no outlines to measure. Their metrics have to be derived from the strike.
++bool ass_font_is_color_only(ASS_Font *font, int face_index);
++// Metrics of a color glyph, in 26.6 pixels for an em of `size` pixels, derived
++// from the strike. Only valid for ass_font_is_color_only faces.
++bool ass_font_color_metrics(ASS_Font *font, int face_index, int glyph_index,
++                            double size, FT_Glyph_Metrics *m);
++void ass_font_clear_color(ColorBitmap *bm);
+ void ass_face_set_size(FT_Face face, double size);
+ int ass_face_get_weight(FT_Face face);
+ FT_Long ass_face_get_style_flags(FT_Face face);
+diff --git a/libass/ass_fontselect.c b/libass/ass_fontselect.c
+index 2303876..a0c5109 100644
+--- a/libass/ass_fontselect.c
++++ b/libass/ass_fontselect.c
+@@ -261,8 +261,10 @@ get_font_info(FT_Library lib, FT_Face face, const char *fallback_family_name,
+     char *fullnames[MAX_FULLNAME];
+     char *families[MAX_FULLNAME];
+ 
+-    // we're only interested in outlines
+-    if (!(face->face_flags & FT_FACE_FLAG_SCALABLE))
++    // we're only interested in outlines, or in color bitmap strikes for
++    // fonts whose artwork is the strike itself (CBDT/CBLC, sbix)
++    if (!(face->face_flags & FT_FACE_FLAG_SCALABLE) &&
++        !FT_HAS_COLOR(face))
+         return false;
+ 
+     for (i = 0; i < num_names; i++) {
+-- 
+2.51.2.windows.1
+

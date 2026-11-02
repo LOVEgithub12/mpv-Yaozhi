@@ -79,6 +79,10 @@ jobs:
       CURL_COMMIT: c2a04c080d79e1eb5d99bc0a73fd71710aa6d345
       LIBSSH_COMMIT: 26c594227c74bf9fa75fed5d8be61afd1abebc43
       OPENSSL_COMMIT: 052c9eac52d7eb02a61cfe7c70289c13f06a50e1
+      # Color emoji: libass base the CBDT/CBLC series was generated on, and the
+      # last Vulkan loader revision whose treeless-clone preimage still applies.
+      LIBASS_COLOR_EMOJI_COMMIT: 00fe2ec7ae677b7568fbbcbcbcb67d34bb4292a3
+      VULKAN_LOADER_COMMIT: 299c923e47e08148a47b1df7628926cc183cb4fc
 
     steps:
       - name: Install build dependencies
@@ -149,6 +153,25 @@ jobs:
           test "$(git -C "$LEGACY_SPEAKER_CONFIG" rev-parse HEAD)" = "$parent_config"
           test "$(git -C "$LEGACY_SPEAKER_CONFIG" rev-parse 'HEAD^{tree}')" = afb4f3015e3dcc057426a51e80a8757d5d42a5e8
           test -z "$(git -C "$LEGACY_SPEAKER_CONFIG" status --porcelain --untracked-files=all)"
+
+      - name: Materialize frozen native-refresh configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # The native-refresh review froze the CI tools that gate it, this
+          # workflow file included. Stacking color emoji edits that file, so the
+          # frozen gates keep running from the exact reviewed commit rather than
+          # from a re-frozen copy of it.
+          frozen_config=1393dd3715ab02e87162dd541886fabb0766fb6c
+          NATIVE_REFRESH_CONFIG="$RUNNER_TEMP/native-refresh-frozen-config"
+          printf 'NATIVE_REFRESH_CONFIG=%s\n' "$NATIVE_REFRESH_CONFIG" >> "$GITHUB_ENV"
+          timeout --foreground --kill-after=20s 120s \
+            git fetch --no-tags --depth=1 origin "$frozen_config"
+          test ! -e "$NATIVE_REFRESH_CONFIG"
+          git worktree add --detach "$NATIVE_REFRESH_CONFIG" "$frozen_config"
+          test "$(git -C "$NATIVE_REFRESH_CONFIG" rev-parse HEAD)" = "$frozen_config"
+          test "$(git -C "$NATIVE_REFRESH_CONFIG" rev-parse 'HEAD^{tree}')" = 58fa116ff1e9c96268e09dae6b561a8ff1f54c84
+          test -z "$(git -C "$NATIVE_REFRESH_CONFIG" status --porcelain --untracked-files=all)"
 
       - name: Verify Lua subtitle and danmaku policies
         shell: bash
@@ -493,6 +516,68 @@ jobs:
           davs2.write_text(text)
           PY
 
+          # Color emoji: libass must read the CBDT/CBLC strikes a color bitmap
+          # font carries and emit them as their own images; mpv then passes those
+          # through as a separate premultiplied BGRA layer. Pin the libass base
+          # both series were generated on, and teach winbuild to apply them.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          LIBASS_COMMIT = os.environ["LIBASS_COLOR_EMOJI_COMMIT"]
+
+          path = Path("packages/libass.cmake")
+          text = path.read_text()
+
+          tag = f"    GIT_TAG {LIBASS_COMMIT}\n"
+          if tag not in text:
+              anchor = "    GIT_REPOSITORY https://github.com/libass/libass.git\n"
+              if anchor not in text:
+                  raise SystemExit("Could not locate libass repository anchor")
+              text = text.replace(anchor, anchor + tag, 1)
+
+          # A pinned commit is checked out detached; leaving GIT_REMOTE_NAME set
+          # makes winbuild's force-update helper try to resolve @{u}.
+          text = text.replace("    GIT_REMOTE_NAME origin\n", "")
+
+          if "libass-*.patch" not in text:
+              anchor = '    UPDATE_COMMAND ""\n'
+              if anchor not in text:
+                  raise SystemExit("Could not locate libass update anchor")
+              text = text.replace(
+                  anchor,
+                  anchor
+                  + "    PATCH_COMMAND ${EXEC} git am --3way "
+                    "${CMAKE_CURRENT_SOURCE_DIR}/libass-*.patch\n",
+                  1,
+              )
+
+          path.write_text(text)
+
+          # vulkan tracks `main` and is cloned with --filter=tree:0, so git am has
+          # no preimage blobs to three-way merge against once upstream moves the
+          # patched file. Pin the last revision whose preimage still applies.
+          # fontconfig is deliberately not touched here: the frozen native-refresh
+          # preparer asserts its recipe and pins it itself.
+          vulkan = Path("packages/vulkan.cmake")
+          text = vulkan.read_text()
+          if f"    GIT_TAG {os.environ['VULKAN_LOADER_COMMIT']}\n" not in text:
+              if "    GIT_TAG main\n" not in text:
+                  raise SystemExit("Could not locate vulkan branch tag")
+              text = text.replace(
+                  "    GIT_TAG main\n",
+                  f"    GIT_TAG {os.environ['VULKAN_LOADER_COMMIT']}\n",
+                  1,
+              )
+          text = text.replace("    GIT_REMOTE_NAME origin\n", "")
+          vulkan.write_text(text)
+          PY
+
+          cp "$GITHUB_WORKSPACE/build/color-emoji/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch" \
+            packages/
+          cp "$GITHUB_WORKSPACE/build/color-emoji/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch" \
+            packages/
+
           sed -i \
             "/GIT_REPOSITORY https:\\/\\/github.com\\/mpv-player\\/mpv.git/a\\    GIT_TAG $MPV_COMMIT" \
             packages/mpv.cmake
@@ -583,6 +668,19 @@ jobs:
           fi
           grep -Fq -- '-DCURL_USE_OPENSSL=OFF' packages/curl.cmake
           grep -Fq -- '-DCURL_USE_SCHANNEL=ON' packages/curl.cmake
+          grep -Fq "GIT_TAG $LIBASS_COLOR_EMOJI_COMMIT" packages/libass.cmake
+          grep -n 'PATCH_COMMAND.*libass-' packages/libass.cmake
+          grep -Fq "GIT_TAG $VULKAN_LOADER_COMMIT" packages/vulkan.cmake
+          for floating in packages/libass.cmake packages/vulkan.cmake; do
+            if grep -Fq 'GIT_REMOTE_NAME origin' "$floating"; then
+              echo "::error::pinned $floating still uses branch-only force-update"
+              exit 1
+            fi
+          done
+          grep -Fq 'ass_font_get_color_strike' \
+            packages/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch
+          grep -Fq 'IMAGE_TYPE_COLOR' \
+            packages/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch
           grep -Fq -- '-DCURL_CA_NATIVE=ON' packages/curl.cmake
           grep -Fq -- '-DUSE_ECH=OFF' packages/curl.cmake
           if grep -Fq -- '-DCURL_USE_OPENSSL=ON' packages/curl.cmake; then
@@ -732,8 +830,26 @@ jobs:
             --winbuild winbuild/mpv-winbuild-cmake \
             --variant '${{ matrix.variant }}' \
             --asio-sdk "$GITHUB_WORKSPACE/third-party/asio"
-          python3 build/atmos/parity/prepare-native-refresh-winbuild.py \
+          python3 "$NATIVE_REFRESH_CONFIG/build/atmos/parity/prepare-native-refresh-winbuild.py" \
             --winbuild winbuild/mpv-winbuild-cmake --variant '${{ matrix.variant }}'
+          # Color emoji rides on top of the frozen native-refresh layer, so it is
+          # staged only after that preparer has asserted the old chain tail. The
+          # 9310/9311 slots sort after 9309 and apply in the same git am pass.
+          cp "$GITHUB_WORKSPACE/build/color-emoji/mpv-9310-color-emoji-bgra.patch" \
+            winbuild/mpv-winbuild-cmake/packages/
+          cp "$GITHUB_WORKSPACE/build/color-emoji/mpv-9311-split-color-layer.patch" \
+            winbuild/mpv-winbuild-cmake/packages/
+          mapfile -t staged_mpv_patches < <(
+            find winbuild/mpv-winbuild-cmake/packages -maxdepth 1 -type f \
+              -name 'mpv-*.patch' -print | sort
+          )
+          test "${staged_mpv_patches[-1]##*/}" = mpv-9311-split-color-layer.patch
+          test "${staged_mpv_patches[-2]##*/}" = mpv-9310-color-emoji-bgra.patch
+          test "${staged_mpv_patches[-3]##*/}" = mpv-9309-native-refresh-video-priority.patch
+          grep -Fq 'OSDTYPE_SUB_COLOR' \
+            winbuild/mpv-winbuild-cmake/packages/mpv-9311-split-color-layer.patch
+          grep -Fq 'draw_ass_color' \
+            winbuild/mpv-winbuild-cmake/packages/mpv-9310-color-emoji-bgra.patch
           python3 build/atmos/parity/test-native-refresh-source-gate.py \
             --output "native-refresh-gate-contract-${{ matrix.variant }}"
           python3 build/atmos/parity/prepare-dependency-lock.py \
@@ -778,8 +894,29 @@ jobs:
           test -z "$(git status --porcelain)"
           printf 'Preflight passed at %s after %s patches.\n' \
             "$(git rev-parse HEAD)" "${#mpv_patches[@]}"
-          native_refresh_final_commit="$(git rev-parse HEAD)"
-          python3 "$GITHUB_WORKSPACE/build/atmos/parity/verify-native-refresh-source.py" \
+          # Color emoji adds two commits on top of the frozen native-refresh
+          # layer, so HEAD is no longer that layer's own commit. Find it by the
+          # complete tree the review lock froze, never by its position in the
+          # chain, and inspect it in a disposable detached checkout.
+          native_refresh_tree="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["variants"][sys.argv[2]]["source_tree"])' "$GITHUB_WORKSPACE/build/atmos/parity/native-refresh-lock.json" '${{ matrix.variant }}')"
+          native_refresh_final_commit=""
+          for candidate in $(git rev-list HEAD); do
+            if [ "$(git rev-parse "${candidate}^{tree}")" = "$native_refresh_tree" ]; then
+              native_refresh_final_commit="$candidate"
+              break
+            fi
+          done
+          test -n "$native_refresh_final_commit"
+          test "$(git rev-list --count "${native_refresh_final_commit}..HEAD")" = 2
+          grep -Fq 'OSDTYPE_SUB_COLOR' sub/osd_state.h
+          python3 "$GITHUB_WORKSPACE/build/color-emoji/verify-color-emoji-source.py" \
+            --source "$preflight_src" \
+            --winbuild "$GITHUB_WORKSPACE/winbuild/mpv-winbuild-cmake" \
+            --refresh-lock "$NATIVE_REFRESH_CONFIG/build/atmos/parity/native-refresh-lock.json" \
+            --variant '${{ matrix.variant }}' \
+            --output "$GITHUB_WORKSPACE/color-emoji-source-${{ matrix.variant }}.json"
+          git checkout --detach "$native_refresh_final_commit"
+          python3 "$NATIVE_REFRESH_CONFIG/build/atmos/parity/verify-native-refresh-source.py" \
             --source "$preflight_src" --variant '${{ matrix.variant }}' \
             --parent-config "$LEGACY_SPEAKER_CONFIG" \
             --output "$GITHUB_WORKSPACE/native-refresh-source-${{ matrix.variant }}.json"
@@ -862,7 +999,7 @@ jobs:
             --source "$preflight_src" --variant '${{ matrix.variant }}' \
             --output "$GITHUB_WORKSPACE/network-source-restored-${{ matrix.variant }}.json"
           git checkout --detach "$native_refresh_final_commit"
-          python3 "$GITHUB_WORKSPACE/build/atmos/parity/verify-native-refresh-source.py" \
+          python3 "$NATIVE_REFRESH_CONFIG/build/atmos/parity/verify-native-refresh-source.py" \
             --source "$preflight_src" --variant '${{ matrix.variant }}' \
             --parent-config "$LEGACY_SPEAKER_CONFIG" \
             --output "$GITHUB_WORKSPACE/native-refresh-source-restored-${{ matrix.variant }}.json"
@@ -907,6 +1044,20 @@ jobs:
             build/atmos/parity/native-refresh-lock.json
             build/bluray-menu/patches/0064-native-refresh-video-priority.patch
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload color emoji layer evidence
+        if: always() && hashFiles('color-emoji-source-*.json') != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: mpv-color-emoji-layer-${{ matrix.variant }}
+          path: |
+            color-emoji-source-${{ matrix.variant }}.json
+            color-emoji-compiled-source-${{ matrix.variant }}.json
+            build/color-emoji/
+          # The compiled binding only exists once the build itself succeeded, so
+          # a missing file there must not mask the failure that is already visible.
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Restore reusable build cache
@@ -1241,11 +1392,27 @@ jobs:
           winbuild="$GITHUB_WORKSPACE/winbuild/mpv-winbuild-cmake"
           built_dir="$(find "$winbuild/build64" -maxdepth 1 -type d -name 'mpv-x86_64-*' -print -quit)"
           test -n "$built_dir"
-          python3 build/atmos/parity/verify-native-refresh-source.py \
-            --source "$winbuild/src_packages/mpv" --variant '${{ matrix.variant }}' \
+          # HEAD is the color-emoji commit, so bind the binaries to that layer
+          # first, then evaluate the frozen native-refresh gate at the tree it
+          # actually froze (HEAD~2) in a disposable shared clone, exactly like
+          # that gate evaluates its own frozen parent.
+          python3 build/color-emoji/verify-color-emoji-source.py \
+            --source "$winbuild/src_packages/mpv" --winbuild "$winbuild" \
+            --refresh-lock "$NATIVE_REFRESH_CONFIG/build/atmos/parity/native-refresh-lock.json" \
+            --variant '${{ matrix.variant }}' --compiled \
+            --binary "$built_dir/mpv.exe" --binary "$built_dir/mpv.com" \
+            --output "color-emoji-compiled-source-${{ matrix.variant }}.json"
+          refresh_clone="$(mktemp -d)/mpv-native-refresh"
+          git clone --quiet --shared --no-checkout "$winbuild/src_packages/mpv" "$refresh_clone"
+          git -C "$refresh_clone" checkout --quiet --detach HEAD~2
+          test "$(git -C "$refresh_clone" rev-parse 'HEAD^{tree}')" = \
+            "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["variants"][sys.argv[2]]["source_tree"])' "$NATIVE_REFRESH_CONFIG/build/atmos/parity/native-refresh-lock.json" '${{ matrix.variant }}')"
+          python3 "$NATIVE_REFRESH_CONFIG/build/atmos/parity/verify-native-refresh-source.py" \
+            --source "$refresh_clone" --variant '${{ matrix.variant }}' \
             --parent-config "$LEGACY_SPEAKER_CONFIG" --compiled \
             --binary "$built_dir/mpv.exe" --binary "$built_dir/mpv.com" \
             --output "native-refresh-compiled-source-${{ matrix.variant }}.json"
+          rm -rf "${refresh_clone%/*}"
           python3 build/atmos/parity/verify-native-refresh-contract.py \
             --source "$winbuild/src_packages/mpv" --cc /usr/bin/cc \
             --output "native-refresh-compiled-contract-${{ matrix.variant }}.json"
