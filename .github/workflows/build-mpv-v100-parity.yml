@@ -3,7 +3,7 @@ name: "Build V1.0.0 main and Atmos parity candidates"
 on:
   workflow_dispatch:
   push:
-    branches: [color-emoji-build]
+    branches: [color-emoji-build, ce-no-color]
   pull_request:
     branches: [codex/v100-core-parity-20260907]
     paths:
