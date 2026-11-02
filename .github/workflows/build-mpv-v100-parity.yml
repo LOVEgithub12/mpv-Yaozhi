@@ -325,6 +325,53 @@ jobs:
               path.write_text(text)
           PY
 
+          # winbuild clones everything below from a branch tip, so a build a week
+          # after the release silently links a different renderer, text shaper and
+          # shader translator than the core users actually run. The release binary
+          # reports libplacebo v7.360.0-237-gc9076f7, which is the only ground
+          # truth available; the rest are those branches as of that same day.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          DEPENDENCY_PINS = [
+              ("packages/libplacebo.cmake", "c9076f7cba48443ef51638361bddd5165e9a596c"),
+              ("packages/harfbuzz.cmake", "75d8ac5d2313842550174eaab0cbaf653c8f2f77"),
+              ("packages/freetype2.cmake", "4ba7c3d82ab8b3cc80b869337d2c2b1913c5e415"),
+              ("packages/fribidi.cmake", "d2f3e1f4946e7cef9789e1c3ebdb4a60d4314c7f"),
+              ("packages/spirv-cross.cmake", "d8f6641eaa6902ba6905eb8fafa2240c8cd8b725"),
+              ("packages/shaderc.cmake", "2737994b552137a85545f956e303d620e6ff232c"),
+              ("packages/xxhash.cmake", "936e8366437c8d8226959bd5e609a7ff288dba8d"),
+              ("packages/fast_float.cmake", "0de7a21da582b6c84b0546772a96549882905d2b"),
+              ("packages/lcms2.cmake", "1112313b3784ced9297d8c0ee076aba17499827a"),
+          ]
+
+          for name, commit in DEPENDENCY_PINS:
+              path = Path(name)
+              text = path.read_text()
+
+              if commit not in text:
+                  for branch in ("main", "master", "dev"):
+                      tag = f"    GIT_TAG {branch}\n"
+                      if tag in text:
+                          text = text.replace(tag, f"    GIT_TAG {commit}\n", 1)
+                          break
+                  else:
+                      if "    GIT_TAG " in text:
+                          raise SystemExit(f"Unexpected branch tag in {name}")
+                      anchor = next(
+                          (line for line in text.splitlines(True)
+                           if line.startswith("    GIT_REPOSITORY ")),
+                          None,
+                      )
+                      if anchor is None:
+                          raise SystemExit(f"Could not locate a git anchor in {name}")
+                      text = text.replace(anchor, anchor + f"    GIT_TAG {commit}\n", 1)
+
+              text = text.replace("    GIT_REMOTE_NAME origin\n", "")
+
+              path.write_text(text)
+          PY
+
           # libaribcaption renamed its MD5 helpers to aribcc_md5_* (6c3b4f3,
           # 2026-10-06) so they no longer collide with OpenSSL's MD5_*. Until
           # then winbuild compiled its own md5.c out with -DHAVE_OPENSSL=1 and
@@ -610,6 +657,23 @@ jobs:
               exit 1
             fi
           done
+          for pin in \
+            "packages/libplacebo.cmake c9076f7cba48443ef51638361bddd5165e9a596c" \
+            "packages/harfbuzz.cmake 75d8ac5d2313842550174eaab0cbaf653c8f2f77" \
+            "packages/freetype2.cmake 4ba7c3d82ab8b3cc80b869337d2c2b1913c5e415" \
+            "packages/fribidi.cmake d2f3e1f4946e7cef9789e1c3ebdb4a60d4314c7f" \
+            "packages/spirv-cross.cmake d8f6641eaa6902ba6905eb8fafa2240c8cd8b725" \
+            "packages/shaderc.cmake 2737994b552137a85545f956e303d620e6ff232c" \
+            "packages/xxhash.cmake 936e8366437c8d8226959bd5e609a7ff288dba8d" \
+            "packages/fast_float.cmake 0de7a21da582b6c84b0546772a96549882905d2b" \
+            "packages/lcms2.cmake 1112313b3784ced9297d8c0ee076aba17499827a"; do
+            set -- $pin
+            grep -Fq "GIT_TAG $2" "$1" || { echo "::error::$1 is not pinned to $2"; exit 1; }
+            if grep -Fq 'GIT_REMOTE_NAME origin' "$1"; then
+              echo "::error::pinned $1 still uses branch-only force-update"
+              exit 1
+            fi
+          done
           if grep -Fq 'HAVE_OPENSSL' packages/libaribcaption.cmake; then
             echo "::error::libaribcaption still asks for OpenSSL's MD5_*"
             exit 1
@@ -827,6 +891,14 @@ jobs:
           # workaround is upstream. Recreate it explicitly so a restored cache
           # cannot reuse a different unpinned source revision.
           rm -rf src_packages/openssl build64/packages/openssl-prefix
+          # These are now pinned to revisions that match the release build, but
+          # the restored cache holds whatever their branch tips were when they
+          # were last cloned. Drop those checkouts and their stamps so the pin is
+          # the revision that actually gets linked, then let mpv relink.
+          for package in libplacebo harfbuzz freetype2 fribidi spirv-cross \
+                         shaderc xxhash fast_float lcms2; do
+            rm -rf "src_packages/$package" "build64/packages/${package}-prefix"
+          done
           rm -rf build64/packages/mpv-release-prefix \
             build64/packages/mpv-packaging-prefix \
             build64/mpv-x86_64-* \
@@ -1201,6 +1273,13 @@ jobs:
           grep -Fq 'dolby-vision-el-type' artifact-check/mpv.strings
           grep -Fq 'dolby-vision-config-rpu-present' artifact-check/mpv.strings
           grep -Fq 'SystemMediaTransportControls' artifact-check/mpv.strings
+          # Proof the dependency pins were actually linked, not just written into
+          # the cmake files: mpv embeds the libplacebo revision it built against.
+          grep -Fq 'v7.360.0-237-gc9076f7' artifact-check/mpv.strings
+          # Recorded for provenance comparison against the released binary, which
+          # floats all of these. Nothing here fails the build.
+          grep -Eo 'harfbuzz [0-9][0-9.]*|freetype [0-9][0-9.]*|fribidi [0-9][0-9.]*|libass [0-9][0-9.]*' \
+            artifact-check/mpv.strings | sort -u || true
           # The authored Blu-ray pairing path is runtime-only and its MP_VERBOSE
           # text may be removed by the Windows release linker. Source
           # application is checked above; the Windows validation job checks the
