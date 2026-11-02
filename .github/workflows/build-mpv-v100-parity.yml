@@ -246,11 +246,11 @@ jobs:
           cppwinrt.write_text(text)
           PY
 
-          # Color emoji: libass must read the CBDT/CBLC strike a color font
-          # carries and hand the pixels back as their own image; mpv must then
-          # pack those as premultiplied BGRA instead of tinting a coverage map.
-          # Upstream libass is not pinned here, so pin the base these patches
-          # were generated against to keep `git am --3way` applicable.
+          # Control build: no color-emoji patches at all, so a measurement on the
+          # user's own path says what this chain costs before any of our work is
+          # in it. libass stays pinned to the revision the color patches were
+          # generated against, because a floating libass would move under both
+          # arms and then the comparison would prove nothing.
           python3 - <<'PY'
           from pathlib import Path
 
@@ -266,28 +266,8 @@ jobs:
                   raise SystemExit("Could not locate libass repository anchor")
               text = text.replace(anchor, anchor + tag, 1)
 
-          if "libass-*.patch" not in text:
-              anchor = '    UPDATE_COMMAND ""\n'
-              if anchor not in text:
-                  raise SystemExit("Could not locate libass update anchor")
-              text = text.replace(
-                  anchor,
-                  anchor
-                  + "    PATCH_COMMAND ${EXEC} git am --3way "
-                    "${CMAKE_CURRENT_SOURCE_DIR}/libass-*.patch\n",
-                  1,
-              )
-
           path.write_text(text)
           PY
-
-          color_emoji="$GITHUB_WORKSPACE/build/color-emoji"
-          cp "$color_emoji/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch" \
-            packages/
-          cp "$color_emoji/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch" \
-            packages/
-          cp "$color_emoji/mpv-9100-color-emoji-bgra.patch" packages/
-          cp "$color_emoji/mpv-9110-split-color-layer.patch" packages/
 
           # fontconfig and vulkan float on `main` and winbuild clones both with
           # --filter=tree:0, so a treeless checkout has no preimage blobs for
@@ -601,7 +581,10 @@ jobs:
           grep -Fq 'orig->channels != 12' \
             packages/sdl2-9001-spatial-channel-counts.patch
           grep -Fq "GIT_TAG 00fe2ec7ae677b7568fbbcbcbcb67d34bb4292a3" packages/libass.cmake
-          grep -n 'PATCH_COMMAND.*libass-' packages/libass.cmake
+          if grep -Fq 'PATCH_COMMAND' packages/libass.cmake; then
+            echo "::error::control build must not patch libass"
+            exit 1
+          fi
           grep -Fq "GIT_TAG 62cfe6b228598e183db16b9fff381c6f8120138c" packages/fontconfig.cmake
           grep -Fq "GIT_TAG 299c923e47e08148a47b1df7628926cc183cb4fc" packages/vulkan.cmake
           for floating in packages/fontconfig.cmake packages/vulkan.cmake; do
@@ -614,37 +597,8 @@ jobs:
             echo "::error::libaribcaption still asks for OpenSSL's MD5_*"
             exit 1
           fi
-          grep -Fq 'ass_font_get_color_strike' \
-            packages/libass-0001-font-read-and-resample-embedded-color-bitmaps.patch
-          grep -Fq 'IMAGE_TYPE_COLOR' \
-            packages/libass-0002-render-draw-color-bitmap-glyphs-as-their-own-images.patch
-          grep -Fq 'draw_ass_color' packages/mpv-9100-color-emoji-bgra.patch
-          grep -Fq 'is_color' packages/mpv-9100-color-emoji-bgra.patch
-          grep -Fq 'OSDTYPE_SUB_COLOR' packages/mpv-9110-split-color-layer.patch
-          grep -Fq 'OSDTYPE_SUB2_COLOR' packages/mpv-9110-split-color-layer.patch
-          grep -Fq 'get_color_bitmaps' packages/mpv-9110-split-color-layer.patch
-          # Rewriting the blend to avoid `x / (255 * 255)` was measured
-          # CPU-neutral: the divisor is a compile-time constant, so GCC already
-          # strength-reduces it. The real cost is the BGRA path itself, which is
-          # why color bitmaps now live on their own layer.
-          if grep -Fq 'div255sq' packages/*.patch; then
-            echo "::error::division rewrite is rejected by measurement"
-            exit 1
-          fi
-          # Packing each glyph into its own slot was measured slower than the
-          # merged rectangles (48 dropped frames per 20 s against 35, and it
-          # left stale pixels), so it must not come back unnoticed.
-          if grep -Fq 'pack_rgba_slots' packages/mpv-9100-color-emoji-bgra.patch; then
-            echo "::error::per-slot color packing is rejected by measurement"
-            exit 1
-          fi
-          # The candidate mailbox must not touch the subtitle packing this
-          # patch depends on; both series are applied to the same tree.
-          if grep -Fq 'diff --git a/sub/packer.c' \
-            packages/mpv-9000-candidate-c318236.patch; then
-            echo "::error::candidate mpv patch overlaps the color emoji patch"
-            exit 1
-          fi
+          # The color-emoji patch assertions do not belong in this control build:
+          # those files are never staged here.
           if grep -E 'list\(APPEND removed .*"curl"' packages/CMakeLists.txt; then
             echo "::error::curl is still excluded from the mpv dependency graph"
             exit 1
@@ -827,6 +781,10 @@ jobs:
           # workaround is upstream. Recreate it explicitly so a restored cache
           # cannot reuse a different unpinned source revision.
           rm -rf src_packages/openssl build64/packages/openssl-prefix
+          # libass has no PATCH_COMMAND in this control build, so the loop above
+          # leaves it alone. The shared cache holds the libass that the color
+          # builds patched; re-clone it or this arm silently inherits them.
+          rm -rf src_packages/libass build64/packages/libass-prefix
           rm -rf build64/packages/mpv-release-prefix \
             build64/packages/mpv-packaging-prefix \
             build64/mpv-x86_64-* \
